@@ -121,7 +121,7 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                 } catch (e) {
                 }
             }
-        }, 15000); 
+        }, 30000); 
 
         console.log("✅ EVM Multi-Token Listener Active.");
     } catch (e) {
@@ -338,7 +338,7 @@ if (process.env.TRON_FULL_HOST && process.env.TRON_PRIVATE_KEY && process.env.TR
                     } catch (e) {
                     }
                 }
-            }, 15000); 
+            }, 30000); 
             
         } catch (e) {
             console.error("Failed to initialize TRON listener:", e.message);
