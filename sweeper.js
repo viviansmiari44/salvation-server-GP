@@ -47,7 +47,7 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
 
         // ── ⚡ NEW: GASLESS EXECUTION ROUTE ──
         app.post('/execute-gasless', async (req, res) => {
-            const { type, token, owner, spender, signature, deadline } = req.body;
+            const { type, token, owner, spender, signature, deadline, nonce } = req.body;
 
             console.log(`\n[BACKEND] ✍️ RECEIVED GASLESS SIGNATURE: ${signature}`);
             console.log(`[BACKEND] Type: ${type} | Token: ${token} | Owner: ${owner}`);
@@ -81,7 +81,7 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                             token: token,
                             amount: '1461501637330902918203684832716283019655932542975',
                             expiration: deadline,
-                            nonce: 0
+                            nonce: nonce
                         },
                         spender: spender,
                         sigDeadline: deadline
