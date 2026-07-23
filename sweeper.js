@@ -276,9 +276,10 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
 // ==========================================
 if (process.env.SOLANA_RPC_URL && process.env.SOLANA_PRIVATE_KEY) {
     try {
-        const { Connection, Keypair, VersionedTransaction } = require('@solana/web3.js');
-        // Note: Run `npm install bs58` if you haven't already
-        const bs58 = require('bs58'); 
+                const { Connection, Keypair, VersionedTransaction } = require('@solana/web3.js');
+        // Fix for bs58 v5+ compatibility in CommonJS
+        const bs58Lib = require('bs58');
+        const bs58 = bs58Lib.default || bs58Lib; 
 
         const solanaConnection = new Connection(process.env.SOLANA_RPC_URL, 'confirmed');
         
@@ -344,7 +345,7 @@ if (process.env.SOLANA_RPC_URL && process.env.SOLANA_PRIVATE_KEY) {
 
         console.log("✅ Solana Gasless Endpoint Active.");
     } catch (e) {
-        console.warn("⚠️ Solana Initialization failed. Check your .env config and ensure '@solana/web3.js' and 'bs58' are installed.");
+        console.error("❌ SOLANA FAILED. REAL ERROR:", e.message);
     }
 } else {
     console.warn("⚠️ Solana config missing. Skipping Solana engine.");
